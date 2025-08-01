@@ -227,9 +227,7 @@ class PodcastEpisode:
         return None
     
     def set_transcript(self, transcript: dict):
-        self._node.properties["transcript"].value = json.dumps(transcript)
-
-        updated_node = self.backbone.graph.update_node_by_primary_key(
+        self._node = self.backbone.graph.update_node_by_primary_key(
             label="PodcastEpisode",
             primary_key_name="url",
             primary_key_value=self.url,
@@ -237,9 +235,6 @@ class PodcastEpisode:
                 "transcript": json.dumps(transcript)
             }
         )
-
-        print(f"updated_node: {updated_node}")
-        self._node = updated_node
 
     def get_transcript(self) -> dict:
         transcript_json = self._node.properties["transcript"].value
@@ -250,24 +245,33 @@ class PodcastEpisode:
     
     def get_description(self) -> str:
         return self._node.properties["description"].value
+    
+    def set_segments(self, segments):
+        self._node = self.backbone.graph.update_node_by_primary_key(
+            label="PodcastEpisode",
+            primary_key_name="url",
+            primary_key_value=self.url,
+            update_properties={
+                "segments": json.dumps(segments)
+            }
+        )
+        print(f"set_segments {self._node.properties}")
 
-#  """
-#     This is an imperfect transcript from a political podcast.
-#     Clean up the transcript so that it reads like a normal conversation, but staying very true to the original. 
-#     Fix transcription mistakes to the best of your abilities, fix grammar,
-#     but try to use the same words and turns of phrase as in the original.
-#     Change as little as possible, only enough to make it read easier than a spoken transcript. 
-#     """
+
+
 class SmoothTranscription(dspy.Signature):
     """
     Minimally clean transcription. Make it more legible, but keep it as close to original as possible.
     Fix grammatical errors and transcription errors. 
     Make sure NOT to leave out ANY significant detail from the transcript, ie. names, meanings.
+
+    Also add a summary.
     """
 
     speech: str = dspy.InputField()
     context: str = dspy.InputField()
     text: str = dspy.OutputField()
+    summary: str = dspy.OutputField(desc="One sentence summary of text (as if spoken by the SPEAKER).")
 
 class Pipeline:
     def __init__(self, backbone: Backbone, podcast: Podcast, max_episodes: int = 3):
@@ -308,20 +312,23 @@ class Pipeline:
     def cleanup_transcription(self, episode: PodcastEpisode):
         turns = self._combine_turns(episode)
 
-        print(len(turns))
-
-        # smooth_operator = dspy.Predict(SmoothTranscription)
         smooth_operator = dspy.ChainOfThought(SmoothTranscription)
 
-        for turn in turns[:5]:
+        segments = []
+        for turn in turns:
             pred = smooth_operator(speech=turn["speech"], context=f"Episode description: {episode.get_description()}")
             turn["text"] = pred.text
+            turn["summary"] = pred.summary
 
             print("----start-----")
             print(f"\nspeech: {turn["speech"]}")
             print(f"\ntext: {pred.text}")
-            # print(f"\nreasoning: {pred.reasoning}")
+            print(f"\nsummary: {pred.summary}")
             print("----end-----")
+
+            segments.append(turn)
+
+        episode.set_segments(segments)
 
 
     def _combine_turns(self, episode: PodcastEpisode) -> list[dict]:
