@@ -1,0 +1,110 @@
+nodes:
+  - label: Podcast
+    properties:
+      youtube_channel_url:
+        type: STRING
+        primary_key: true
+      title:
+        type: STRING
+      description:
+        type: STRING
+      number_of_subscribers:
+        type: INT64
+      channel_follower_count:
+        type: INT64
+      channel_meta_json: # raw metadata from YouTube
+        type: STRING
+      created_at:
+        type: TIMESTAMP
+
+  - label: PodcastEpisode
+    properties:
+      url:
+        type: STRING
+        primary_key: true
+      title:
+        type: STRING
+      date:
+        type: DATE
+      description:
+        type: STRING
+      duration:
+        type: INT64
+      transcript:
+        type: STRING
+      segments:
+        type: STRING
+      t11n_clean:
+        type: STRING
+      summary:
+        type: STRING
+      created_at:
+        type: TIMESTAMP
+
+  - label: Paragraph
+    properties:
+      id:
+        type: SERIAL
+        primary_key: true
+      text:
+        type: STRING
+      summary:
+        type: STRING
+      timestamp_start:
+        type: INT64
+      timestamp_end:
+        type: INT64
+      created_at:
+        type: TIMESTAMP
+
+  - label: Person
+    properties:
+      id:
+        type: SERIAL
+        primary_key: true
+      name:
+        type: STRING
+      dbpedia_uri:
+        type: STRING
+      profession:
+        type: STRING
+      description:
+        type: STRING
+      created_at:
+        type: TIMESTAMP
+
+edges:
+  - label: CONTENT
+    from: PodcastEpisode
+    to: Paragraph
+    properties:
+      created_at:
+        type: TIMESTAMP
+
+  - label: NEXT
+    from: Paragraph
+    to: Paragraph
+    properties:
+      created_at:
+        type: TIMESTAMP
+
+  - label: SPOKEN_BY
+    from: Paragraph
+    to: Person
+    properties:
+      created_at:
+        type: TIMESTAMP
+
+  - label: IS_GUEST_ON
+    from: Person
+    to: PodcastEpisode
+    properties:
+      created_at:
+        type: TIMESTAMP
+
+  - label: IS_HOST_OF
+    from: Person
+    to: PodcastEpisode
+    properties:
+      created_at:
+        type: TIMESTAMP
