@@ -16,8 +16,14 @@ import kuzu
 from pathlib import Path
 from backbone import Backbone, Node, NodeMatch, Edge, EdgeMatch, Property, PropertyType, Config, Ontology # type: ignore
 from pprint import pprint
+import dspy
+from datetime import datetime, date
 
 load_dotenv()
+
+# lm = dspy.LM("openai/gpt-4o-mini", api_key=os.getenv("OPENAI_API_KEY"))
+lm = dspy.LM("openai/gpt-4.1-2025-04-14", api_key=os.getenv("OPENAI_API_KEY"))
+dspy.configure(lm=lm)
 
 
 class Podcast:
@@ -198,6 +204,20 @@ class PodcastEpisode:
             print(f"title: {self._title}") # eg "downloads/Daniel Davis： Trump's Threats Against Russia Backfire [Fkqd1bJqaCU].m4a"
             print(f"uploader: {self._uploader}") # eg "downloads/Daniel Davis： Trump's Threats Against Russia Backfire [Fkqd1bJqaCU].m4a"
 
+            self._node = self.backbone.graph.update_node_by_primary_key(
+                label="PodcastEpisode",
+                primary_key_name="url",
+                primary_key_value=self.url,
+                update_properties={
+                    "title": self._title,
+                    "duration": self._duration,
+                    "date": datetime.strptime(self._upload_date, "%Y%m%d").date(),
+                    "description": self._description
+                }
+            )
+            print(f"post_hook updated_node: {self._node}")
+
+
     def get_filename(self):
         """Extract filename from the full path stored in post_hook"""
         if hasattr(self, '_filename') and self._filename:
@@ -227,7 +247,27 @@ class PodcastEpisode:
         if transcript_json:
             return json.loads(transcript_json)
         return None
+    
+    def get_description(self) -> str:
+        return self._node.properties["description"].value
 
+#  """
+#     This is an imperfect transcript from a political podcast.
+#     Clean up the transcript so that it reads like a normal conversation, but staying very true to the original. 
+#     Fix transcription mistakes to the best of your abilities, fix grammar,
+#     but try to use the same words and turns of phrase as in the original.
+#     Change as little as possible, only enough to make it read easier than a spoken transcript. 
+#     """
+class SmoothTranscription(dspy.Signature):
+    """
+    Minimally clean transcription. Make it more legible, but keep it as close to original as possible.
+    Fix grammatical errors and transcription errors. 
+    Make sure NOT to leave out ANY significant detail from the transcript, ie. names, meanings.
+    """
+
+    speech: str = dspy.InputField()
+    context: str = dspy.InputField()
+    text: str = dspy.OutputField()
 
 class Pipeline:
     def __init__(self, backbone: Backbone, podcast: Podcast, max_episodes: int = 3):
@@ -270,6 +310,20 @@ class Pipeline:
 
         print(len(turns))
 
+        # smooth_operator = dspy.Predict(SmoothTranscription)
+        smooth_operator = dspy.ChainOfThought(SmoothTranscription)
+
+        for turn in turns[:5]:
+            pred = smooth_operator(speech=turn["speech"], context=f"Episode description: {episode.get_description()}")
+            turn["text"] = pred.text
+
+            print("----start-----")
+            print(f"\nspeech: {turn["speech"]}")
+            print(f"\ntext: {pred.text}")
+            # print(f"\nreasoning: {pred.reasoning}")
+            print("----end-----")
+
+
     def _combine_turns(self, episode: PodcastEpisode) -> list[dict]:
         transcript = episode.get_transcript()
         turns = transcript["segments"]
@@ -301,7 +355,7 @@ class Pipeline:
                     "end": prev_turn["end"],
                     "speaker": prev_turn["speaker"],
                     "start": start_of_combined_turn,
-                    "text" : " ".join(current_texts)
+                    "speech" : " ".join(current_texts)
                 })
 
                 # mark new start
@@ -314,12 +368,12 @@ class Pipeline:
             "end": prev_turn["end"],
             "speaker": prev_turn["speaker"],
             "start": start_of_combined_turn,
-            "text" : " ".join(current_texts)
+            "speech" : " ".join(current_texts)
         })
 
         for combined_turn in combined_turns:
             print(f"\n---\n{combined_turn["speaker"]} start:{combined_turn["start"]} end:{combined_turn["end"]}")
-            print(combined_turn["text"])
+            print(combined_turn["speech"])
 
         return combined_turns
 

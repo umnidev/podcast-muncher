@@ -34,8 +34,6 @@ nodes:
         type: STRING
       segments:
         type: STRING
-      t11n_clean:
-        type: STRING
       summary:
         type: STRING
       created_at:
