@@ -42,15 +42,16 @@ class Podcast:
         self._load_node()
 
         if not self._node:
-            logging.info("Creating fresh node")
             self._create_node()
 
-        if not self._meta:
-            self.fetch_meta()
+        # always fetch latest
+        self.fetch_meta()
 
-        self.load_episodes()
+        # self.load_episodes()
+        self.thin_load_episodes()
 
     def _create_node(self):
+        logging.info("Creating fresh node")
         node = Node(
             label="Podcast",
             properties={
@@ -62,7 +63,52 @@ class Podcast:
             }
         )
         self._node = self._backbone.graph.add_node(node)
-        logging.debug(f"Podcast: Created node: {self._node}")
+        logging.info("Created Podcast node.")
+
+    def _load_node(self):
+        res = self._backbone.graph.get_node(
+            NodeMatch(
+                label="Podcast",
+                where={"url": self.url},
+            )
+        )
+
+        if res and len(res):
+            self._node = res[0]
+            self._meta = json.loads(self._node.properties["meta_json"].value)
+       
+    def fetch_meta(self):
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True,
+            'dump_single_json': True,
+        }
+        with YoutubeDL(ydl_opts) as ydl:
+            meta = ydl.extract_info(self.url, download=False)
+
+            self._meta = meta
+
+            logging.info(f"Fetched meta")
+
+        self._update_backbone({
+            "title": meta.get("title"),
+            "description": meta.get("description"),
+            "meta_json": json.dumps(meta),
+        })
+
+    # def thin_load_episodes(self):
+    #     if not self._meta:
+    #         logging.warning("No meta, can't load episode.")
+    #         return
+        
+    #     entries = self._meta.get("entries")
+    #     logging.info(f"Entries: {len(entries)}")
+
+    #     # so, simplest way:
+    #     # - just load episodes locally, ie. no PodcastEpisode class
+    #     # - THIS SUCKS!!
+
 
     def load_episodes(self):
         if not self._meta:
@@ -96,41 +142,6 @@ class Podcast:
     def get_episodes(self):
         return self.PodcastEpisodes
 
-    def _load_node(self):
-        res = self._backbone.graph.get_node(
-            NodeMatch(
-                label="Podcast",
-                where={"url": self.url},
-            )
-        )
-
-        if res and len(res):
-            node = res[0]
-            self._node = node
-            self._meta = json.loads(node.properties["meta_json"].value)
-            logging.debug(f"Loaded node: {self._node}")
-       
-    def fetch_meta(self):
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': True,
-            'dump_single_json': True,
-        }
-        with YoutubeDL(ydl_opts) as ydl:
-            meta = ydl.extract_info(self.url, download=False)
-
-            self._meta = meta
-
-            logging.info(f"Fetched meta")
-            logging.debug(f"Fetched meta: {self._meta}")
-
-        self._update_backbone({
-            "title": meta.get("title"),
-            "description": meta.get("description"),
-            "meta_json": json.dumps(meta),
-        })
-
     def _update_backbone(self, update_properties: dict):
         self._node = self._backbone.graph.update_node_by_primary_key(
             label="Podcast",
@@ -146,15 +157,25 @@ class PodcastEpisode:
         self._backbone = backbone
 
         self._node = None
+        self._properties = {}
         self.Paragraphs = []
 
-        self._load_node()
-
+    def save(self):
+        if not self._node:
+            self._load_node()
+    
         if not self._node:
             self._create_node()
+        
+        self._node = self._backbone.graph.update_node_by_primary_key(
+            label="PodcastEpisode",
+            primary_key_name="url",
+            primary_key_value=self.url,
+            update_properties=self._properties
+        )
 
     def _create_node(self):
-        node = Node(
+        self._node = self._backbone.graph.add_node(Node(
             label="PodcastEpisode",
             properties={
                 "url": Property(
@@ -163,9 +184,7 @@ class PodcastEpisode:
                     type=PropertyType.STRING
                 )
             }
-        )
-        self._node = self._backbone.graph.add_node(node)
-        logging.debug(f"PodcastEpisode: Created node: {self._node}")
+        ))
 
     def _load_node(self):
         res = self._backbone.graph.get_node(
@@ -175,13 +194,16 @@ class PodcastEpisode:
             )
         )
         if res and len(res):
-            node = res[0]
-            self._node = node
-            logging.debug(f"PodcastEpisode: loded node: {self._node}")
-    
+            self._node = res[0]
+
+            # set properties from node, but don't overwrite existing on class
+            existing_properties = self._properties
+            node_properties = {key: prop.value for key, prop in self._node.properties.items()}
+            self._properties = node_properties | existing_properties
+
     def post_hook(self, info):
         if info.get("status") == "finished":
-            self._update_backbone({
+            self._properties.update({
                 "title": info["info_dict"]["_filename"],
                 "duration": info["info_dict"]["duration"],
                 "date": datetime.strptime(info["info_dict"]["upload_date"], "%Y%m%d").date(),
@@ -189,39 +211,28 @@ class PodcastEpisode:
                 "display_id": info["info_dict"]["display_id"]
             })
 
-    def _update_backbone(self, update_properties: dict):
-        self._node = self._backbone.graph.update_node_by_primary_key(
-            label="PodcastEpisode",
-            primary_key_name="url",
-            primary_key_value=self.url,
-            update_properties=update_properties
-        )
-        logging.debug(f"PodcastEpisode _update_backbone updated_node: {self._node}")
-
     def get_filename(self):
         """Extract filename from the full path stored in post_hook"""
         if hasattr(self, '_filename') and self._filename:
             f =  os.path.basename(self._filename)
             return f
-        return None
     
     def set_transcript(self, transcript: dict):
-        self._update_backbone({
+        self._properties.update({
             "transcript": json.dumps(transcript)
         })
 
     def get_transcript(self) -> dict:
-        t_json = self._node.properties["transcript"].value
+        t_json = self.properties.get("transcript")
         return json.loads(t_json) if t_json else None
     
     def get_description(self) -> str:
-        return self._node.properties["description"].value
+        return self._properties.get("descriptioon")
     
     def set_paragraphs(self, paragraphs: dict):
         """Called from Pipeline, ie. always with fresh data."""
 
-        # store raw
-        self._update_backbone({
+        self._properties.update({
             "paragraphs_json": json.dumps(paragraphs)
         })
 
@@ -585,7 +596,7 @@ def main():
         url="https://www.youtube.com/@GDiesen1/videos", 
         backbone=backbone
     )
-    logging.info(f"Podcast initated: {podcast} {podcast.url}")
+    logging.info(f"Podcast initiated: {podcast} {podcast.url}")
 
     quit()
 
