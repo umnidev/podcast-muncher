@@ -39,21 +39,8 @@ dspy.configure(lm=lm)
 class Podcast:
     def __init__(self, url: str):
         self.url = url
-        
-        # self._node = None
-        self._meta = None
+        self._properties = {}
         self.PodcastEpisodes = []
-
-        # self._load_node()
-
-        # if not self._node:
-        #     self._create_node()
-
-        # always fetch latest
-        # self.fetch_meta()
-
-        # self.load_episodes()
-        # self.thin_load_episodes()
 
     def fetch_meta(self):
         ydl_opts = {
@@ -64,136 +51,96 @@ class Podcast:
         }
         with YoutubeDL(ydl_opts) as ydl:
             logging.info(f"Fetching meta for {self.url}...")
-            self._meta = ydl.extract_info(self.url, download=False)
+
+            meta = ydl.extract_info(self.url, download=False)
+            if not meta:
+                logging.error(f"Failed to fetch meta for {self.url}")
+                return
+            
+            self._properties["meta"] = meta
+            self._properties["title"] = meta.get("title")
+            self._properties["description"] = meta.get("description")
 
     def load_episodes(self) -> list:
-        if not self._meta:
+        self.PodcastEpisodes = []
+
+        if not self._properties.get("meta"):
             logging.warning("No meta, can't load episodes.")
             return
-        
-        entries = self._meta.get("entries", [])
+
+        entries = self._properties["meta"].get("entries", [])
         logging.info(f"Loading {len(entries)} episodes from meta.")
 
         for entry in entries:
-            episode = PodcastEpisode(url=entry.get("url"), properties={
+            episode = PodcastEpisode(url=entry.get("url"), podcast=self, properties={
                 "title": entry.get("title"),
-                "description": entry.get("description"),
-                "upload_date": entry.get("upload_date"),
-                "duration": entry.get("duration"),
-                "display_id": entry.get("display_id")
+                "description": entry.get("description")
             })
             self.PodcastEpisodes.append(episode)
 
         return self.PodcastEpisodes
      
-    def _create_node(self):
-        records, summary, keys = memgraph.execute_query(
-            "CREATE (p:Podcast {url: $url}) RETURN p",
-            url=self.url
-        )
-        logging.info(f"Created Podcast node: {records} {summary} {keys}")
-
     def save(self):
-        meta = self._meta if self._meta else {}
-        parameters = {
-            "url": self.url,
-            "title": meta.get("channel"),
-            "description": meta.get("description"),
-            "meta": meta,
-        }
         records, summary, keys = memgraph.execute_query(
-            "MERGE (p:Podcast {url: $url, title: $title, description: $description,  meta: $meta}) RETURN p",
-            **parameters
+            """
+            MERGE (p:Podcast {url: $url}) 
+            SET p.title = $title, 
+                p.description = $description, 
+                p.meta = $meta 
+            RETURN p
+            """,
+            url=self.url,
+            **self._properties
         )
-        logging.info(f"Merged Podcast node: {records} {summary} {keys}")
+        logging.info(f"Merged Podcast node.")
 
-        if records and len(records):
-            self._node = records[0]["p"]
-        else:
-            logging.error("Failed to merge Podcast node.")
- 
-
-    def load_node(self):
+    def load(self):
         logging.info(f"Loading Podcast node for URL: {self.url}")
         records, summary, keys = memgraph.execute_query(
-            "MATCH (p:Podcast) WHERE p.url = $url RETURN p LIMIT 1",
+            """
+            MATCH (p:Podcast) 
+            WHERE p.url = $url 
+            RETURN p 
+            LIMIT 1
+            """,
             url=self.url
         )
         if records and len(records):
-            logging.info(f"Found Podcast node: {records[0]}")
-            self._node = records[0]["p"]
+            self._properties = records[0]["p"]._properties
 
-        # res = self._backbone.graph.get_node(
-        #     NodeMatch(
-        #         label="Podcast",
-        #         where={"url": self.url},
-        #     )
-        # )
-
-        # if res and len(res):
-        #     self._node = res[0]
-        #     self._meta = json.loads(self._node.properties["meta_json"].value)
-       
-
-    # def thin_load_episodes(self):
-    #     if not self._meta:
-    #         logging.warning("No meta, can't load episode.")
-    #         return
-        
-    #     entries = self._meta.get("entries")
-    #     logging.info(f"Entries: {len(entries)}")
-
-    #     # so, simplest way:
-    #     # - just load episodes locally, ie. no PodcastEpisode class
-    #     # - THIS SUCKS!!
-
-
-    # def load_episodes(self):
-    #     if not self._meta:
-    #         logging.warning("No meta, can't load episode.")
-    #         return
-        
-    #     entries = self._meta.get("entries")
-    #     logging.info(f"Entries: {len(entries)}")
-  
-    #     for entry in self._meta.get("entries"):
-    #         episode = PodcastEpisode(url=entry.get("url"), backbone=self._backbone)
-    #         self.PodcastEpisodes.append(episode)
-
-    #         node_results = self._backbone.graph.get_node(
-    #             NodeMatch(
-    #                 label="PodcastEpisode",
-    #                 where={"url": episode.url}
-    #             )
-    #         )
-    #         ep_node = node_results[0]
-
-    #         # ensure edge between nodes
-    #         self._backbone.graph.add_edge(Edge(
-    #             label="HAS_EPISODE",
-    #             from_node=self._node,
-    #             to_node=ep_node
-    #         ))
-
-    #     logging.info(f"Loaded {len(self.PodcastEpisodes)} episodes.")
-
-    def get_episodes(self):
-        return self.PodcastEpisodes
-
-    # def _update_backbone(self, update_properties: dict):
-    #     self._node = self._backbone.graph.update_node_by_primary_key(
-    #         label="Podcast",
-    #         primary_key_name="url",
-    #         primary_key_value=self.url,
-    #         update_properties=update_properties
-    #     )
-    #     logging.debug(f"Podcast: updated_node: {self._node}")
 
 class PodcastEpisode:
-    def __init__(self, url: str, properties: dict = {}):
+    def __init__(self, url: str, podcast: Podcast, properties: dict = {}):
         self.url = url
-
+        self.podcast = podcast
         self._properties = properties
+
+    def save(self):
+        if not self._properties:
+            logging.warning("No properties to save.")
+            return
+        
+        # Build SET clause dynamically - use 'pe' to match the MERGE variable
+        set_clauses = [f"pe.{key} = ${key}" for key in self._properties.keys()]
+        set_clause = ", ".join(set_clauses)
+    
+        query = f"""
+        MERGE (pe:PodcastEpisode {{url: $url}}) 
+        SET {set_clause}
+        WITH pe
+        MATCH (p:Podcast {{url: $podcast_url}})
+        MERGE (p)-[:HAS_EPISODE]->(pe)
+        RETURN pe
+        """
+        
+        records, summary, keys = memgraph.execute_query(
+            query,
+            url=self.url,
+            podcast_url=self.podcast.url,
+            **self._properties
+        )
+
+        logging.info(f"Merged PodcastEpisode node.")
 
     def download(self):
         """Download episode using yt-dlp. Save to file."""
@@ -216,11 +163,13 @@ class PodcastEpisode:
         See https://replicate.com/predictions?prediction=8e1g02sdj1rj60crc8ar2kpz4m for progress
         """
 
-        if self.get_transcript():
+        if self._properties.get("transcript"):
             logging.info("Transcript already exists. Skipping!")
             return
 
-        output = replicate.run(
+        logging.info(f"Transcribing {self._properties.get('title')}...")
+
+        transcript = replicate.run(
             "victor-upmeet/whisperx:84d2ad2d6194fe98a17d2b60bef1c7f910c46b2f6fd38996ca457afd9c8abfcb",
             input={
                 "debug": False,
@@ -239,19 +188,27 @@ class PodcastEpisode:
             }
         )
 
-        self.set_transcript(output)
+        if not transcript:
+            raise Exception("Transcription failed.")
 
-    
+        self._properties["transcript"] = transcript
+
     def post_process_transcription(self):
-        turns = self._combine_turns()
-
+        """
+        Post-process transcription to combine speaker turns into paragraphs,
+        and clean up the text using a language model.
+        This will also add summaries to each paragraph.
+        """
+        if not self._properties.get("transcript"):
+            raise Exception("No transcript to post-process.")
+        
         smooth_operator = dspy.ChainOfThought(SmoothTranscription)
 
         paragraphs = []
-        for turn in turns:
+        for turn in self._combine_turns():
             pred = smooth_operator(
                 speech=turn["speech"], 
-                context=f"Episode description: {self.get_description()}"
+                context=f"Episode description: {self._properties.get('description', '')}",
             )
             
             turn["text"] = pred.text
@@ -267,13 +224,32 @@ class PodcastEpisode:
 
             paragraphs.append(turn)
 
-        self.set_paragraphs(paragraphs)
+        self._properties["paragraphs"] = paragraphs
+    
+
+    def post_hook(self, info):
+        """Post-hook for yt-dlp to store metadata after download."""
+        if info.get("status") == "finished":
+            self._properties.update({
+                "filename": info["info_dict"]["_filename"],
+                "duration": info["info_dict"]["duration"],
+                "date": datetime.strptime(info["info_dict"]["upload_date"], "%Y%m%d").date(),
+                "description": info["info_dict"]["description"],
+                "display_id": info["info_dict"]["display_id"]
+            })
+            logging.info(f"Downloaded successfully. {self._properties}")
+
+    def get_filename(self):
+        """Extract filename from the full path stored in post_hook"""
+        filename = self._properties.get("filename")
+        return os.path.basename(filename)
 
     def _combine_turns(self) -> list[dict]:
         """Combine speaker turns into one full turn."""
 
-        transcript = self.get_transcript()
+        logging.info("Combining speaker turns into paragraphs...")
 
+        transcript = self._properties.get("transcript")
         turns = transcript["segments"]
 
         combined_turns = []
@@ -320,120 +296,41 @@ class PodcastEpisode:
 
         return combined_turns
 
-
-    # def save(self):
-    #     if not self._node:
-    #         self._load_node()
     
-    #     if not self._node:
-    #         self._create_node()
-        
-    #     self._node = self._backbone.graph.update_node_by_primary_key(
-    #         label="PodcastEpisode",
-    #         primary_key_name="url",
-    #         primary_key_value=self.url,
-    #         update_properties=self._properties
-    #     )
+    # def _sync(self):
+    #     """
+    #     A method to sync the data in the class 
+    #     with that in the Backbone graph.
 
-    # def _create_node(self):
-    #     self._node = self._backbone.graph.add_node(Node(
-    #         label="PodcastEpisode",
-    #         properties={
-    #             "url": Property(
-    #                 name="url",
-    #                 value=self.url,
-    #                 type=PropertyType.STRING
-    #             )
-    #         }
-    #     ))
+    #     Should be idempotent.
 
-    # def _load_node(self):
-    #     res = self._backbone.graph.get_node(
-    #         NodeMatch(
-    #             label="PodcastEpisode",
-    #             where={"url": self.url},
-    #         )
-    #     )
-    #     if res and len(res):
-    #         self._node = res[0]
+    #     Should check if node exists in Backbone.
+    #         If exists, should update the class.
+    #         If not exists, should create immediately.
+    #     If already inited, ie. self._node is not None,
+    #         then any unsynced parameters between class
+    #         backbone should be synced, class overwriting 
+    #         backbone. 
+    #     Should also handle edges. 
 
-    #         # set properties from node, but don't overwrite existing on class
-    #         existing_properties = self._properties
-    #         node_properties = {key: prop.value for key, prop in self._node.properties.items()}
-    #         self._properties = node_properties | existing_properties
+    #     ###
 
-    def post_hook(self, info):
-        if info.get("status") == "finished":
-            self._properties.update({
-                "title": info["info_dict"]["_filename"],
-                "duration": info["info_dict"]["duration"],
-                "date": datetime.strptime(info["info_dict"]["upload_date"], "%Y%m%d").date(),
-                "description": info["info_dict"]["description"],
-                "display_id": info["info_dict"]["display_id"]
-            })
-
-    def get_filename(self):
-        """Extract filename from the full path stored in post_hook"""
-        if hasattr(self, '_filename') and self._filename:
-            f =  os.path.basename(self._filename)
-            return f
-    
-    def set_transcript(self, transcript: dict):
-        self._properties.update({
-            "transcript": json.dumps(transcript)
-        })
-
-    def get_transcript(self) -> dict:
-        t_json = self._properties.get("transcript")
-        return json.loads(t_json) if t_json else None
-    
-    def get_description(self) -> str:
-        return self._properties.get("description")
-    
-    def set_paragraphs(self, paragraphs: dict):
-        """Called from Pipeline, ie. always with fresh data."""
-
-        self._properties.update({
-            "paragraphs_json": json.dumps(paragraphs)
-        })
-
-    def get_paragraphs(self):
-        return self.Paragraphs
-
-    def _sync(self):
-        """
-        A method to sync the data in the class 
-        with that in the Backbone graph.
-
-        Should be idempotent.
-
-        Should check if node exists in Backbone.
-            If exists, should update the class.
-            If not exists, should create immediately.
-        If already inited, ie. self._node is not None,
-            then any unsynced parameters between class
-            backbone should be synced, class overwriting 
-            backbone. 
-        Should also handle edges. 
-
-        ###
-
-        - it's tricky to mirror three things: real-world text, classes, and graph nodes/edges
-        - perhaps this is not the best approach
-        - the main problem arises from needing to be idempotent; both creating and handling
-          existing, and syncing both ways. 
-        - would be a lot easier if we did one-way street: churning through data and writing
-          into backbone, and not dealing with classes created from existing nodes/edges in bb.
-        - Podcast class is the only one that updates in the real world: there are more episodes
-          added to it. Episodes, once created, do not change, nor does its content.
-        - In other words, Podcast class could be read from backbone, and its meta re-fetched,
-          in order to discover new episodes. Everything else, ie. PodcastEpisode classes, 
-          Paragraph classes, etc. are created just in order to process and store data, once.
-        - Thus, we do not need to worry about retriving existing Paragraphs, for example, but
-          instead we create them, always create.
-        - This greatly simplifies our handling.  
-        """
-        pass
+    #     - it's tricky to mirror three things: real-world text, classes, and graph nodes/edges
+    #     - perhaps this is not the best approach
+    #     - the main problem arises from needing to be idempotent; both creating and handling
+    #       existing, and syncing both ways. 
+    #     - would be a lot easier if we did one-way street: churning through data and writing
+    #       into backbone, and not dealing with classes created from existing nodes/edges in bb.
+    #     - Podcast class is the only one that updates in the real world: there are more episodes
+    #       added to it. Episodes, once created, do not change, nor does its content.
+    #     - In other words, Podcast class could be read from backbone, and its meta re-fetched,
+    #       in order to discover new episodes. Everything else, ie. PodcastEpisode classes, 
+    #       Paragraph classes, etc. are created just in order to process and store data, once.
+    #     - Thus, we do not need to worry about retriving existing Paragraphs, for example, but
+    #       instead we create them, always create.
+    #     - This greatly simplifies our handling.  
+    #     """
+    #     pass
 
         
 
@@ -470,8 +367,7 @@ class Sentence:
 #     long_summary: str = dspy.OutputField(desc="One paragraph summary of text (as if spoken by the SPEAKER).")
 
 class Pipeline:
-    def __init__(self, backbone: Backbone, podcast: Podcast, max_episodes: int = 3):
-        self._backbone = backbone
+    def __init__(self, podcast: Podcast, max_episodes: int = 3):
         self.podcast = podcast
         self.max_episodes = max_episodes
  
@@ -489,150 +385,32 @@ class Pipeline:
         # store Nodes
         # store Edges
 
-        episodes = self.podcast.get_episodes()
-        logging.info(f"Pipeline episodes: {len(episodes)}")
+        episodes = self.podcast.PodcastEpisodes
+        if not episodes:
+            episodes = self.podcast.load_episodes()
+            
+        logging.info(f"Pipeline episodes: {len(episodes)}. Handling {self.max_episodes} episodes.")
 
-        for episode in self.podcast.get_episodes()[:2]:
+        for episode in episodes[:self.max_episodes]:
             self.run_episode_tasks(episode)
 
     def run_episode_tasks(self, episode: PodcastEpisode):
-            
-            # download
-            # self.download_episode(episode) # post-hook stores meta
-            episode.download()
 
-            # transcribe
-            # self.transcribe_episode(episode)
-            episode.transcribe()
+            try:
+                # download
+                episode.download()
 
-            # clean up transcription / diarization
-            # self.cleanup_transcription(episode)
-            episode.post_process_transcription()
+                # transcribe
+                episode.transcribe()
 
-    # def cleanup_transcription(self, episode: PodcastEpisode):
-    #     turns = self._combine_turns(episode)
+                # clean up transcription / diarization
+                episode.post_process_transcription()
 
-    #     smooth_operator = dspy.ChainOfThought(SmoothTranscription)
-
-    #     paragraphs = []
-    #     for turn in turns:
-    #         pred = smooth_operator(
-    #             speech=turn["speech"], 
-    #             context=f"Episode description: {episode.get_description()}"
-    #         )
-            
-    #         turn["text"] = pred.text
-    #         turn["summary"] = pred.summary
-    #         turn["long_summary"] = pred.long_summary
-
-    #         print("----start-----")
-    #         print(f"\nspeech: {turn["speech"]}")
-    #         print(f"\ntext: {pred.text}")
-    #         print(f"\nsummary: {pred.summary}")
-    #         print(f"\nlong_summary: {pred.long_summary}")
-    #         print("----end-----")
-
-    #         paragraphs.append(turn)
-
-    #     episode.set_paragraphs(paragraphs)
-
-
-    # def _combine_turns(self, episode: PodcastEpisode) -> list[dict]:
-    #     """Combine speaker turns into one full turn."""
-
-    #     transcript = episode.get_transcript()
-
-    #     pprint(f"Transcript {transcript}")
-
-    #     turns = transcript["segments"]
-
-    #     combined_turns = []
-    #     current_texts = []
-    #     prev_turn = None
-    #     for turn in turns:
-            
-    #         # first round
-    #         if not prev_turn:
-    #             prev_turn = turn
-    #             start_of_combined_turn = turn["start"]
-    #             current_texts.append(turn["text"])
-    #             continue
-
-    #         # same speaker, continue
-    #         if prev_turn["speaker"] == turn["speaker"]:
-    #             prev_turn = turn
-    #             current_texts.append(turn["text"])
-    #             continue
-
-    #         # new speaker, record combined turn
-    #         else:
-
-    #             # store combined turn
-    #             combined_turns.append({
-    #                 "end": prev_turn["end"],
-    #                 "speaker": prev_turn["speaker"],
-    #                 "start": start_of_combined_turn,
-    #                 "speech" : " ".join(current_texts)
-    #             })
-
-    #             # mark new start
-    #             start_of_combined_turn = turn["start"]
-    #             current_texts = []
-    #             prev_turn = turn
-
-    #     # last turn
-    #     combined_turns.append({
-    #         "end": prev_turn["end"],
-    #         "speaker": prev_turn["speaker"],
-    #         "start": start_of_combined_turn,
-    #         "speech" : " ".join(current_texts)
-    #     })
-
-    #     return combined_turns
-
-    # def transcribe_episode(self, episode: PodcastEpisode):
-    #     """
-    #     Transcribe using Replicate interference.
-        
-    #     See https://replicate.com/predictions?prediction=8e1g02sdj1rj60crc8ar2kpz4m for progress
-    #     """
-
-    #     if episode.get_transcript():
-    #         logging.info("Transcript already exists. Skipping!")
-    #         return
-
-    #     output = replicate.run(
-    #         "victor-upmeet/whisperx:84d2ad2d6194fe98a17d2b60bef1c7f910c46b2f6fd38996ca457afd9c8abfcb",
-    #         input={
-    #             "debug": False,
-    #             "vad_onset": 0.5,
-    #             "audio_file": f"{os.getenv("NGROK_URL")}/{episode.get_filename()}",
-    #             "batch_size": 64,
-    #             "vad_offset": 0.363,
-    #             "diarization": True,
-    #             "temperature": 0,
-    #             "align_output": True,
-    #             "max_speakers": 3, # TODO: set dynamically
-    #             "min_speakers": 1,
-    #             "huggingface_access_token": os.getenv("HUGGINGFACE_TOKEN"),
-    #             "language_detection_min_prob": 0,
-    #             "language_detection_max_tries": 5
-    #         }
-    #     )
-
-    #     episode.set_transcript(output)
-   
-    # def download_episode(self, episode):
-    #     ydl_opts = {
-    #         "paths": {"home": "downloads"},
-    #         "format": "m4a/bestaudio/best",
-    #         "cookiesfrombrowser": ("brave", "default", "BASICTEXT"),
-    #         # "cookiefile": "youtube.cookie"
-    #         "postprocessor_hooks": [episode.post_hook]
-    #     }
-
-    #     with YoutubeDL(ydl_opts) as ydl:
-    #         error_code = ydl.download([episode.url])
+                # save episode to graph
+                episode.save()
+            except Exception as e:
+                logging.error(f"Error processing episode {episode.url}: {e}")
+                logging.warning("Episode was not saved to graph.")
 
 
 class Planning:
@@ -756,7 +534,13 @@ def init_memgraph():
         session.run("CREATE INDEX ON :Person(name)")
         logging.info("Created index for Person.")
 
-
+def clear_memgraph():
+    """
+    Clear all nodes and edges in Memgraph database.
+    """
+    with memgraph.session() as session:
+        session.run("MATCH (n) DETACH DELETE n")
+        logging.info("Cleared all nodes and edges in Memgraph.")
 
 # def main():
 
@@ -793,13 +577,17 @@ def init_memgraph():
 
 def main():
     # init_memgraph()
+    # clear_memgraph()
 
     podcast = Podcast(url="https://www.youtube.com/@GDiesen1/videos")
     podcast.fetch_meta()
     podcast.save()
-    # podcast.load_node()
+    # podcast.load()
     episodes = podcast.load_episodes()
     logging.info(f"Podcast episodes: {len(episodes)}")
+
+    pipeline = Pipeline(podcast, max_episodes=4)
+    pipeline.run_podcast()
 
 
 
