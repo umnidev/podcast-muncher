@@ -1,5 +1,4 @@
 from yt_dlp import YoutubeDL
-import whisperx
 import replicate
 import os
 import re
@@ -8,89 +7,110 @@ from dotenv import load_dotenv
 import requests
 import math
 import subprocess
-import duckdb
-import sqlite3
 import json
 import yaml
-import kuzu
 from pathlib import Path
 from backbone import Backbone, Node, NodeMatch, Edge, EdgeMatch, Property, PropertyType, Config, Ontology # type: ignore
 from pprint import pprint
 import dspy
 from datetime import datetime, date
+import logging
+
+logging.basicConfig(level=logging.INFO, format="{levelname} - {message}", style="{")
 
 load_dotenv()
 
-# lm = dspy.LM("openai/gpt-4o-mini", api_key=os.getenv("OPENAI_API_KEY"))
 lm = dspy.LM("openai/gpt-4.1-2025-04-14", api_key=os.getenv("OPENAI_API_KEY"))
 dspy.configure(lm=lm)
 
 
+# TODO:
+# - Connect Podcast-HAS_EPISODE->PodcastEpisode
+# - Connect PodcastEpisode - FIRST_PARAGRAPH -> Paragraph
+# - Connect Paragraph -> NEXT_PARAGRAPH -> Paragraph
+# - Connect Paragraph -> EXPRESSED_BY -> Person
+
 class Podcast:
-    def __init__(self, youtube_channel_url: str, backbone: Backbone = None, fetch_playlist: bool = False):
-        self.backbone = backbone
-
+    def __init__(self, url: str, backbone: Backbone):
+        self.url = url
+        self._backbone = backbone
+        
         self._node = None
-
-        # set default values
-        self.properties = {}
-        self.properties["title"] = None
-        self.properties["description"] = None
-        self.properties["channel_meta_json"] = None
-        self.properties["youtube_channel_url"] = youtube_channel_url
-
         self._meta = None
-        self._loaded = False
-        self._episodes = []
+        self.PodcastEpisodes = []
 
-        self.read_backbone()
+        self._load_node()
 
-        if fetch_playlist and not self._loaded:
-            self.fetch_playlist()
+        if not self._node:
+            logging.info("Creating fresh node")
+            self._create_node()
+
+        if not self._meta:
+            self.fetch_meta()
 
         self.load_episodes()
 
+    def _create_node(self):
+        node = Node(
+            label="Podcast",
+            properties={
+                "url": Property(
+                    name="url",
+                    value=self.url,
+                    type=PropertyType.STRING
+                )
+            }
+        )
+        self._node = self._backbone.graph.add_node(node)
+        logging.debug(f"Podcast: Created node: {self._node}")
+
     def load_episodes(self):
         if not self._meta:
+            logging.warning("No meta, can't load episode.")
             return
         
-        for entry in self._meta["entries"]:
-            episode = PodcastEpisode(url=entry["url"], backbone=self.backbone)
-            self._episodes.append(episode)
+        entries = self._meta.get("entries")
+        logging.info(f"Entries: {len(entries)}")
+  
+        for entry in self._meta.get("entries"):
+            episode = PodcastEpisode(url=entry.get("url"), backbone=self._backbone)
+            self.PodcastEpisodes.append(episode)
 
-        print(f"Loaded {len(self._episodes)} episodes.")
-
-    def get_episodes(self):
-        return self._episodes
-
-    def read_backbone(self):
-        if self.backbone:
-            podcasts = self.backbone.graph.get_node(
+            node_results = self._backbone.graph.get_node(
                 NodeMatch(
-                    label="Podcast",
-                    where={"youtube_channel_url": self.properties.get("youtube_channel_url")},
+                    label="PodcastEpisode",
+                    where={"url": episode.url}
                 )
             )
+            ep_node = node_results[0]
 
-            if podcasts and len(podcasts):
-                self._load(podcasts[0])
-            else:
-                print("Podcast does not yet exist in Backbone")
+            # ensure edge between nodes
+            self._backbone.graph.add_edge(Edge(
+                label="HAS_EPISODE",
+                from_node=self._node,
+                to_node=ep_node
+            ))
 
+        logging.info(f"Loaded {len(self.PodcastEpisodes)} episodes.")
+
+    def get_episodes(self):
+        return self.PodcastEpisodes
+
+    def _load_node(self):
+        res = self._backbone.graph.get_node(
+            NodeMatch(
+                label="Podcast",
+                where={"url": self.url},
+            )
+        )
+
+        if res and len(res):
+            node = res[0]
+            self._node = node
+            self._meta = json.loads(node.properties["meta_json"].value)
+            logging.debug(f"Loaded node: {self._node}")
        
-
-    def _load(self, podcast: Node):
-        print(f"Found existing podcast in Backbone: {podcast.properties.get("title").value}")
-
-        self.properties["title"] = podcast.properties["title"].value
-        self.properties["description"] = podcast.properties["description"].value
-        self.properties["channel_meta_json"] = podcast.properties["channel_meta_json"].value
-
-        self._meta = json.loads(podcast.properties["channel_meta_json"].value)
-        
-        self._loaded = True
-
-    def fetch_playlist(self):
+    def fetch_meta(self):
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
@@ -98,170 +118,167 @@ class Podcast:
             'dump_single_json': True,
         }
         with YoutubeDL(ydl_opts) as ydl:
-            channel_meta = ydl.extract_info(self.properties.get("youtube_channel_url"), download=False)
+            meta = ydl.extract_info(self.url, download=False)
 
-            self.properties["title"] = channel_meta.get("title")
-            self.properties["description"] = channel_meta.get("description")
-            self.properties["channel_meta_json"] = json.dumps(channel_meta)
+            self._meta = meta
 
-            self._meta = channel_meta # shorthand
+            logging.info(f"Fetched meta")
+            logging.debug(f"Fetched meta: {self._meta}")
 
-            # Print some key metadata
-            print(f"Channel title: {channel_meta.get('channel')}")
-            print(f"Subscribers: {channel_meta.get('channel_follower_count')}")
-            print(f"Description: {channel_meta.get('description')}")
+        self._update_backbone({
+            "title": meta.get("title"),
+            "description": meta.get("description"),
+            "meta_json": json.dumps(meta),
+        })
 
-        self._commit()
-
-    def _commit(self):
-        """Commit data to Backbone"""
-
-        if not self.backbone:
-            return
-        
-        podcast = Node(
+    def _update_backbone(self, update_properties: dict):
+        self._node = self._backbone.graph.update_node_by_primary_key(
             label="Podcast",
-            # TODO: shouldn't be necessary to set key name, since it's redundant in Property itself. Could instead be a List[Property]
-            properties={
-                "youtube_channel_url": Property(
-                    # TODO: name is misleading, should instead be KEY / VALUE
-                    name="youtube_channel_url",
-                    value=self.properties.get("youtube_channel_url"),
-                    type=PropertyType.STRING
-                ),
-                "title": Property(
-                    name="title",
-                    value=self.properties.get("title"),
-                    type=PropertyType.STRING
-                ),
-                "description": Property(
-                    name="description",
-                    value=self.properties.get("description"),
-                    type=PropertyType.STRING
-                ),
-                "channel_meta_json": Property(
-                    name="channel_meta_json",
-                    value=self.properties.get("channel_meta_json"),
-                    type=PropertyType.STRING
-                ),
-            }
+            primary_key_name="url",
+            primary_key_value=self.url,
+            update_properties=update_properties
         )
-        saved = self.backbone.graph.add_node(podcast)
-        print(f"Saved")
-    
-class PodcastEpisode:
-    def __init__(self, url: str, backbone: Backbone = None):
-        self._node = None
-        self.url = url
-        self.backbone = backbone
+        logging.debug(f"Podcast: updated_node: {self._node}")
 
-        self.read_backbone()
+class PodcastEpisode:
+    def __init__(self, url: str, backbone: Backbone):
+        self.url = url
+        self._backbone = backbone
+
+        self._node = None
+        self.Paragraphs = []
+
+        self._load_node()
 
         if not self._node:
-            # need to register a node
-            node = Node(
-                label="PodcastEpisode",
-                properties={
-                    "url": Property(
-                        name="url",
-                        value=self.url,
-                        type=PropertyType.STRING
-                    )
-                }
-            )
-            self._node = self.backbone.graph.add_node(node)
+            self._create_node()
 
-
-    def read_backbone(self):
-        if self.backbone:
-            episodes = self.backbone.graph.get_node(
-                NodeMatch(
-                    label="PodcastEpisode",
-                    where={"url": self.url},
+    def _create_node(self):
+        node = Node(
+            label="PodcastEpisode",
+            properties={
+                "url": Property(
+                    name="url",
+                    value=self.url,
+                    type=PropertyType.STRING
                 )
-            )
-            if episodes and len(episodes):
-                node = episodes[0]
-                self._node = node
-    
+            }
+        )
+        self._node = self._backbone.graph.add_node(node)
+        logging.debug(f"PodcastEpisode: Created node: {self._node}")
 
-    def post_hook(self, info):
-        if info["status"] == "finished":
-
-            self._filename = info["info_dict"]["_filename"]
-            self._description = info["info_dict"]["description"]
-            self._comment_count = info["info_dict"]["comment_count"]
-            self._duration = info["info_dict"]["duration"]
-            self._display_id = info["info_dict"]["display_id"]
-            self._upload_date = info["info_dict"]["upload_date"]
-            self._title = info["info_dict"]["title"]
-            self._uploader = info["info_dict"]["uploader"]
-
-            print(f"filename: {self._filename}") # eg "downloads/Daniel Davis： Trump's Threats Against Russia Backfire [Fkqd1bJqaCU].m4a"
-            print(f"description: {self._description}") # eg "downloads/Daniel Davis： Trump's Threats Against Russia Backfire [Fkqd1bJqaCU].m4a"
-            print(f"comment_count: {self._comment_count}") # eg "downloads/Daniel Davis： Trump's Threats Against Russia Backfire [Fkqd1bJqaCU].m4a"
-            print(f"duration: {self._duration}") # eg "downloads/Daniel Davis： Trump's Threats Against Russia Backfire [Fkqd1bJqaCU].m4a"
-            print(f"display_id: {self._display_id}") # eg "downloads/Daniel Davis： Trump's Threats Against Russia Backfire [Fkqd1bJqaCU].m4a"
-            print(f"upload_date: {self._upload_date}") # eg "downloads/Daniel Davis： Trump's Threats Against Russia Backfire [Fkqd1bJqaCU].m4a"
-            print(f"title: {self._title}") # eg "downloads/Daniel Davis： Trump's Threats Against Russia Backfire [Fkqd1bJqaCU].m4a"
-            print(f"uploader: {self._uploader}") # eg "downloads/Daniel Davis： Trump's Threats Against Russia Backfire [Fkqd1bJqaCU].m4a"
-
-            self._node = self.backbone.graph.update_node_by_primary_key(
+    def _load_node(self):
+        res = self._backbone.graph.get_node(
+            NodeMatch(
                 label="PodcastEpisode",
-                primary_key_name="url",
-                primary_key_value=self.url,
-                update_properties={
-                    "title": self._title,
-                    "duration": self._duration,
-                    "date": datetime.strptime(self._upload_date, "%Y%m%d").date(),
-                    "description": self._description
-                }
+                where={"url": self.url},
             )
-            print(f"post_hook updated_node: {self._node}")
+        )
+        if res and len(res):
+            node = res[0]
+            self._node = node
+            logging.debug(f"PodcastEpisode: loded node: {self._node}")
+    
+    def post_hook(self, info):
+        if info.get("status") == "finished":
+            self._update_backbone({
+                "title": info["info_dict"]["_filename"],
+                "duration": info["info_dict"]["duration"],
+                "date": datetime.strptime(info["info_dict"]["upload_date"], "%Y%m%d").date(),
+                "description": info["info_dict"]["description"],
+                "display_id": info["info_dict"]["display_id"]
+            })
 
+    def _update_backbone(self, update_properties: dict):
+        self._node = self._backbone.graph.update_node_by_primary_key(
+            label="PodcastEpisode",
+            primary_key_name="url",
+            primary_key_value=self.url,
+            update_properties=update_properties
+        )
+        logging.debug(f"PodcastEpisode _update_backbone updated_node: {self._node}")
 
     def get_filename(self):
         """Extract filename from the full path stored in post_hook"""
         if hasattr(self, '_filename') and self._filename:
             f =  os.path.basename(self._filename)
-            print(f"filename only: {f}")
             return f
         return None
     
     def set_transcript(self, transcript: dict):
-        self._node = self.backbone.graph.update_node_by_primary_key(
-            label="PodcastEpisode",
-            primary_key_name="url",
-            primary_key_value=self.url,
-            update_properties={
-                "transcript": json.dumps(transcript)
-            }
-        )
+        self._update_backbone({
+            "transcript": json.dumps(transcript)
+        })
 
     def get_transcript(self) -> dict:
-        transcript_json = self._node.properties["transcript"].value
-        print(type(transcript_json))
-        if transcript_json:
-            return json.loads(transcript_json)
-        return None
+        t_json = self._node.properties["transcript"].value
+        return json.loads(t_json) if t_json else None
     
     def get_description(self) -> str:
         return self._node.properties["description"].value
     
-    def set_segments(self, segments):
-        self._node = self.backbone.graph.update_node_by_primary_key(
-            label="PodcastEpisode",
-            primary_key_name="url",
-            primary_key_value=self.url,
-            update_properties={
-                "segments": json.dumps(segments)
-            }
-        )
-        print(f"set_segments {self._node.properties}")
+    def set_paragraphs(self, paragraphs: dict):
+        """Called from Pipeline, ie. always with fresh data."""
 
-    def get_segments(self):
-        return json.loads(self._node.properties["segments"].value)
+        # store raw
+        self._update_backbone({
+            "paragraphs_json": json.dumps(paragraphs)
+        })
 
+    def get_paragraphs(self):
+        return self.Paragraphs
+
+    def _sync(self):
+        """
+        A method to sync the data in the class 
+        with that in the Backbone graph.
+
+        Should be idempotent.
+
+        Should check if node exists in Backbone.
+            If exists, should update the class.
+            If not exists, should create immediately.
+        If already inited, ie. self._node is not None,
+            then any unsynced parameters between class
+            backbone should be synced, class overwriting 
+            backbone. 
+        Should also handle edges. 
+
+        ###
+
+        - it's tricky to mirror three things: real-world text, classes, and graph nodes/edges
+        - perhaps this is not the best approach
+        - the main problem arises from needing to be idempotent; both creating and handling
+          existing, and syncing both ways. 
+        - would be a lot easier if we did one-way street: churning through data and writing
+          into backbone, and not dealing with classes created from existing nodes/edges in bb.
+        - Podcast class is the only one that updates in the real world: there are more episodes
+          added to it. Episodes, once created, do not change, nor does its content.
+        - In other words, Podcast class could be read from backbone, and its meta re-fetched,
+          in order to discover new episodes. Everything else, ie. PodcastEpisode classes, 
+          Paragraph classes, etc. are created just in order to process and store data, once.
+        - Thus, we do not need to worry about retriving existing Paragraphs, for example, but
+          instead we create them, always create.
+        - This greatly simplifies our handling.  
+        """
+
+        
+
+
+class Paragraph:
+    """Each paragraph of text, from a single speaker."""
+    def __init__(self, meta: dict, backbone: Backbone, podcast_episode: PodcastEpisode):
+        self._meta = meta
+        self._backbone = backbone
+        self.PodcastEpisode = podcast_episode
+
+        self._node = None
+
+
+class Sentence:
+    """Could be cool, but too complicated for now."""
+    def __init__(self, text: str):
+        pass
 
 
 class SmoothTranscription(dspy.Signature):
@@ -270,17 +287,18 @@ class SmoothTranscription(dspy.Signature):
     Fix grammatical errors and transcription errors. 
     Make sure NOT to leave out ANY significant detail from the transcript, ie. names, meanings.
 
-    Also add a summary.
+    Also add short- and long summaries, in the voice and perspective of the SPEAKER.
     """
 
     speech: str = dspy.InputField()
     context: str = dspy.InputField()
     text: str = dspy.OutputField()
     summary: str = dspy.OutputField(desc="One sentence summary of text (as if spoken by the SPEAKER).")
+    long_summary: str = dspy.OutputField(desc="One paragraph summary of text (as if spoken by the SPEAKER).")
 
 class Pipeline:
     def __init__(self, backbone: Backbone, podcast: Podcast, max_episodes: int = 3):
-        self.backbone = backbone
+        self._backbone = backbone
         self.podcast = podcast
         self.max_episodes = max_episodes
  
@@ -299,9 +317,9 @@ class Pipeline:
         # store Edges
 
         episodes = self.podcast.get_episodes()
-        print(f"Pipeline episodes: {len(episodes)}")
+        logging.info(f"Pipeline episodes: {len(episodes)}")
 
-        for episode in self.podcast.get_episodes()[:4]:
+        for episode in self.podcast.get_episodes()[:2]:
             self.run_episode_tasks(episode)
 
     def run_episode_tasks(self, episode: PodcastEpisode):
@@ -320,32 +338,42 @@ class Pipeline:
 
         smooth_operator = dspy.ChainOfThought(SmoothTranscription)
 
-        segments = []
+        paragraphs = []
         for turn in turns:
-            pred = smooth_operator(speech=turn["speech"], context=f"Episode description: {episode.get_description()}")
+            pred = smooth_operator(
+                speech=turn["speech"], 
+                context=f"Episode description: {episode.get_description()}"
+            )
+            
             turn["text"] = pred.text
             turn["summary"] = pred.summary
+            turn["long_summary"] = pred.long_summary
 
             print("----start-----")
             print(f"\nspeech: {turn["speech"]}")
             print(f"\ntext: {pred.text}")
             print(f"\nsummary: {pred.summary}")
+            print(f"\nlong_summary: {pred.long_summary}")
             print("----end-----")
 
-            segments.append(turn)
+            paragraphs.append(turn)
 
-        episode.set_segments(segments)
+        episode.set_paragraphs(paragraphs)
 
 
     def _combine_turns(self, episode: PodcastEpisode) -> list[dict]:
+        """Combine speaker turns into one full turn."""
+
         transcript = episode.get_transcript()
+
+        pprint(f"Transcript {transcript}")
+
         turns = transcript["segments"]
 
         combined_turns = []
-        prev_turn = None
         current_texts = []
+        prev_turn = None
         for turn in turns:
-            print(f"{turn["speaker"]} start:{turn["start"]} end:{turn["end"]}")
             
             # first round
             if not prev_turn:
@@ -384,10 +412,6 @@ class Pipeline:
             "speech" : " ".join(current_texts)
         })
 
-        for combined_turn in combined_turns:
-            print(f"\n---\n{combined_turn["speaker"]} start:{combined_turn["start"]} end:{combined_turn["end"]}")
-            print(combined_turn["speech"])
-
         return combined_turns
 
     def transcribe_episode(self, episode: PodcastEpisode):
@@ -398,7 +422,7 @@ class Pipeline:
         """
 
         if episode.get_transcript():
-            print("Transcript already exists. Skipping!")
+            logging.info("Transcript already exists. Skipping!")
             return
 
         output = replicate.run(
@@ -421,8 +445,6 @@ class Pipeline:
         )
 
         episode.set_transcript(output)
-
-
    
     def download_episode(self, episode):
         ydl_opts = {
@@ -433,12 +455,8 @@ class Pipeline:
             "postprocessor_hooks": [episode.post_hook]
         }
 
-        print(f"download ydl_opts {ydl_opts}")
-
         with YoutubeDL(ydl_opts) as ydl:
             error_code = ydl.download([episode.url])
-            print(f"error_code: {error_code}")
-        
 
 
 class Planning:
@@ -555,19 +573,21 @@ def main():
     backbone = Backbone(config)
     # backbone.clear_graph()
     backbone.set_ontology(ontology)
-    print(backbone.get_ontology().as_yaml())
+    logging.debug(backbone.get_ontology().as_yaml())
 
     # quit()
     # episode = PodcastEpisode(url="https://www.youtube.com/watch?v=Fkqd1bJqaCU", backbone=backbone)
-    # for segment in episode.get_segments():
+    # for segment in episode.get_paragraphs():
     #     print(f"{segment["speaker"]}: {segment["summary"]}")
     # quit()
 
     podcast = Podcast(
-        youtube_channel_url="https://www.youtube.com/@GDiesen1/videos", 
+        url="https://www.youtube.com/@GDiesen1/videos", 
         backbone=backbone
     )
-    # podcast.fetch_playlist()
+    logging.info(f"Podcast initated: {podcast} {podcast.url}")
+
+    quit()
 
     pipeline = Pipeline(backbone, podcast)
     pipeline.run_podcast()

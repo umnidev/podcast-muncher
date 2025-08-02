@@ -1,27 +1,33 @@
 nodes:
   - label: Podcast
     properties:
-      youtube_channel_url:
+      id:
+        type: SERIAL
+      url:
         type: STRING
         primary_key: true
       title:
         type: STRING
       description:
         type: STRING
-      number_of_subscribers:
+      subscriber_count:
         type: INT64
-      channel_follower_count:
+      follower_count:
         type: INT64
-      channel_meta_json: # raw metadata from YouTube
+      meta_json: # raw metadata from YouTube
         type: STRING
       created_at:
         type: TIMESTAMP
 
   - label: PodcastEpisode
     properties:
+      id:
+        type: SERIAL
       url:
         type: STRING
         primary_key: true
+      display_id:
+        type: STRING
       title:
         type: STRING
       date:
@@ -32,7 +38,7 @@ nodes:
         type: INT64
       transcript:
         type: STRING
-      segments:
+      paragraphs_json:
         type: STRING
       summary:
         type: STRING
@@ -48,6 +54,8 @@ nodes:
         type: STRING
       summary:
         type: STRING
+      long_summary:
+        type: STRING
       timestamp_start:
         type: INT64
       timestamp_end:
@@ -60,7 +68,9 @@ nodes:
       id:
         type: SERIAL
         primary_key: true
-      name:
+      first_name:
+        type: STRING
+      last_name:
         type: STRING
       dbpedia_uri:
         type: STRING
@@ -72,21 +82,21 @@ nodes:
         type: TIMESTAMP
 
 edges:
-  - label: CONTENT
+  - label: FIRST_PARAGRAPH
     from: PodcastEpisode
     to: Paragraph
     properties:
       created_at:
         type: TIMESTAMP
 
-  - label: NEXT
+  - label: NEXT_PARAGRAPH
     from: Paragraph
     to: Paragraph
     properties:
       created_at:
         type: TIMESTAMP
 
-  - label: SPOKEN_BY
+  - label: EXPRESSED_BY
     from: Paragraph
     to: Person
     properties:
