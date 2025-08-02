@@ -1,0 +1,331 @@
+nodes:
+  - labels: ["Podcast"]
+    count: 1
+    properties:
+      - key: "id"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "SERIAL"
+            count: 1
+      - key: "url"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "title"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "description"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "subscriber_count"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "INT64"
+            count: 1
+      - key: "follower_count"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "INT64"
+            count: 1
+      - key: "meta_json"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "created_at"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "TIMESTAMP"
+            count: 1
+
+  - labels: ["PodcastEpisode"]
+    count: 1
+    properties:
+      - key: "id"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "SERIAL"
+            count: 1
+      - key: "url"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "display_id"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "title"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "date"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "DATE"
+            count: 1
+      - key: "description"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "duration"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "INT64"
+            count: 1
+      - key: "transcript"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "paragraphs_json"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "summary"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "created_at"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "TIMESTAMP"
+            count: 1
+
+  - labels: ["Paragraph"]
+    count: 1
+    properties:
+      - key: "id"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "SERIAL"
+            count: 1
+      - key: "text"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "summary"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "long_summary"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "timestamp_start"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "INT64"
+            count: 1
+      - key: "timestamp_end"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "INT64"
+            count: 1
+      - key: "created_at"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "TIMESTAMP"
+            count: 1
+
+  - labels: ["Person"]
+    count: 1
+    properties:
+      - key: "id"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "SERIAL"
+            count: 1
+      - key: "first_name"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "last_name"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "dbpedia_uri"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "profession"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "description"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "STRING"
+            count: 1
+      - key: "created_at"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "TIMESTAMP"
+            count: 1
+
+edges:
+  - type: "FIRST_PARAGRAPH"
+    start_node_labels: ["PodcastEpisode"]
+    end_node_labels: ["Paragraph"]
+    count: 1
+    properties:
+      - key: "created_at"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "TIMESTAMP"
+            count: 1
+
+  - type: "NEXT_PARAGRAPH"
+    start_node_labels: ["Paragraph"]
+    end_node_labels: ["Paragraph"]
+    count: 1
+    properties:
+      - key: "created_at"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "TIMESTAMP"
+            count: 1
+
+  - type: "EXPRESSED_BY"
+    start_node_labels: ["Paragraph"]
+    end_node_labels: ["Person"]
+    count: 1
+    properties:
+      - key: "created_at"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "TIMESTAMP"
+            count: 1
+
+  - type: "IS_GUEST_ON"
+    start_node_labels: ["Person"]
+    end_node_labels: ["PodcastEpisode"]
+    count: 1
+    properties:
+      - key: "created_at"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "TIMESTAMP"
+            count: 1
+
+  - type: "IS_HOST_OF"
+    start_node_labels: ["Person"]
+    end_node_labels: ["PodcastEpisode"]
+    count: 1
+    properties:
+      - key: "created_at"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "TIMESTAMP"
+            count: 1
+
+  - type: "HAS_EPISODE"
+    start_node_labels: ["Podcast"]
+    end_node_labels: ["PodcastEpisode"]
+    count: 1
+    properties:
+      - key: "created_at"
+        count: 1
+        filling_factor: 100.00
+        types:
+          - type: "TIMESTAMP"
+            count: 1
+
+node_indexes:
+  - labels: ["Podcast"]
+    properties: ["url"]
+    count: 1
+    type: "label+property"
+
+  - labels: ["PodcastEpisode"]
+    properties: ["url"]
+    count: 1
+    type: "label+property"
+
+  - labels: ["Paragraph"]
+    properties: ["id"]
+    count: 1
+    type: "label+property"
+
+  - labels: ["Person"]
+    properties: ["id"]
+    count: 1
+    type: "label+property"
+
+node_constraints:
+  - type: "unique"
+    labels: ["Podcast"]
+    properties: ["url"]
+    data_type: "STRING"
+
+  - type: "unique"
+    labels: ["PodcastEpisode"]
+    properties: ["url"]
+    data_type: "STRING"
+
+  - type: "unique"
+    labels: ["Paragraph"]
+    properties: ["id"]
+    data_type: "SERIAL"
+
+  - type: "unique"
+    labels: ["Person"]
+    properties: ["id"]
+    data_type: "SERIAL"
+
+enums: []
