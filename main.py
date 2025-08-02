@@ -30,6 +30,8 @@ class Podcast:
     def __init__(self, youtube_channel_url: str, backbone: Backbone = None, fetch_playlist: bool = False):
         self.backbone = backbone
 
+        self._node = None
+
         # set default values
         self.properties = {}
         self.properties["title"] = None
@@ -257,6 +259,9 @@ class PodcastEpisode:
         )
         print(f"set_segments {self._node.properties}")
 
+    def get_segments(self):
+        return json.loads(self._node.properties["segments"].value)
+
 
 
 class SmoothTranscription(dspy.Signature):
@@ -279,7 +284,7 @@ class Pipeline:
         self.podcast = podcast
         self.max_episodes = max_episodes
  
-    def run(self):
+    def run_podcast(self):
 
         # get list of episodes from podcast (already stored in metadata)
         # create PodcastEpisode class
@@ -288,6 +293,7 @@ class Pipeline:
         # download audio of episode as wav (to tmp file)
         # transcribe using Replicate API (needs file hosted with ngrok)
         # clean up and process transcription & diarization using LLM
+        # identify SPEAKER -> Person
         # create Paragraph's
         # store Nodes
         # store Edges
@@ -295,7 +301,7 @@ class Pipeline:
         episodes = self.podcast.get_episodes()
         print(f"Pipeline episodes: {len(episodes)}")
 
-        for episode in self.podcast.get_episodes()[:1]:
+        for episode in self.podcast.get_episodes()[:4]:
             self.run_episode_tasks(episode)
 
     def run_episode_tasks(self, episode: PodcastEpisode):
@@ -551,6 +557,12 @@ def main():
     backbone.set_ontology(ontology)
     print(backbone.get_ontology().as_yaml())
 
+    # quit()
+    # episode = PodcastEpisode(url="https://www.youtube.com/watch?v=Fkqd1bJqaCU", backbone=backbone)
+    # for segment in episode.get_segments():
+    #     print(f"{segment["speaker"]}: {segment["summary"]}")
+    # quit()
+
     podcast = Podcast(
         youtube_channel_url="https://www.youtube.com/@GDiesen1/videos", 
         backbone=backbone
@@ -558,8 +570,10 @@ def main():
     # podcast.fetch_playlist()
 
     pipeline = Pipeline(backbone, podcast)
+    pipeline.run_podcast()
 
-    pipeline.run()
+    
+    # pipeline.run_episode(url="")
 
 
 

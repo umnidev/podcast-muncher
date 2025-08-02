@@ -106,3 +106,10 @@ edges:
     properties:
       created_at:
         type: TIMESTAMP
+
+  - label: HAS_EPISODE
+    from: Podcast
+    to: PodcastEpisode
+    properties:
+      created_at:
+        type: TIMESTAMP
