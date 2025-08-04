@@ -1,12 +1,27 @@
 services:
   memgraph:
     image: memgraph/memgraph-mage:latest
+    volumes:
+      - memgraph_data:/var/lib/memgraph
+      - memgraph_logs:/var/log/memgraph
     ports:
       - "7687:7687"
       - "7444:7444"
+    restart: always
+    command:
+      - "--log-level=INFO"
+      - "--query-execution-timeout-sec=600"
+      - "--storage-snapshot-interval-sec=300"
+      - "--also-log-to-stderr=true"
+
   lab:
     image: memgraph/lab:latest
     ports:
       - "3000:3000"
     environment:
       QUICK_CONNECT_MG_HOST: memgraph
+    restart: always
+
+volumes:
+  memgraph_data:
+  memgraph_logs:

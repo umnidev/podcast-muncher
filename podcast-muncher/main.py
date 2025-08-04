@@ -1,3 +1,4 @@
+from functools import wraps
 from yt_dlp import YoutubeDL
 import replicate
 import os
@@ -24,6 +25,10 @@ memgraph.verify_connectivity()
 logging.basicConfig(
     level=logging.INFO, format="{levelname} - {message}", style="{"
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)  # If using httpx
+logging.getLogger("httpcore").setLevel(
+    logging.WARNING
+)  # Also needed for httpx
 
 load_dotenv()
 
@@ -31,17 +36,54 @@ lm = dspy.LM("openai/gpt-4.1-2025-04-14", api_key=os.getenv("OPENAI_API_KEY"))
 dspy.configure(lm=lm)
 
 
-# TODO:
-# - Connect Podcast-HAS_EPISODE->PodcastEpisode
-# - Connect PodcastEpisode - FIRST_PARAGRAPH -> Paragraph
-# - Connect Paragraph -> NEXT_PARAGRAPH -> Paragraph
-# - Connect Paragraph -> EXPRESSED_BY -> Person
+def retry_on_failure(max_retries=3, delay=1.0, exponential_backoff=True):
+    """Decorator to retry functions on failure."""
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            current_delay = delay
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt < max_retries:
+                        logging.warning(
+                            f"{func.__name__} attempt {attempt + 1} failed: {e}. Retrying in {current_delay}s..."
+                        )
+                        time.sleep(current_delay)
+                        if exponential_backoff:
+                            current_delay *= 2
+                    else:
+                        logging.error(
+                            f"{func.__name__} failed after {max_retries + 1} attempts: {e}"
+                        )
+                        raise
+            return None
+
+        return wrapper
+
+    return decorator
+
+
+@retry_on_failure(max_retries=3, delay=1.0)
+def memgraph_query(query: str, **params):
+    """
+    Execute a query against the Memgraph database.
+    """
+    try:
+        records, summary, keys = memgraph.execute_query(query, **params)
+        return records, summary, keys
+    except Exception as e:
+        logging.error(f"Error executing graph query: {e}")
+        return [], None, None
 
 
 class Planning:
     """
 
     INPUT is a YT channel url
+
 
     (For each step, store data directly in Kuzu)
 
@@ -63,6 +105,7 @@ class Planning:
             |host
             |etc
 
+
         - PodcastEpisode
             |title
             |num
@@ -77,6 +120,7 @@ class Planning:
             |>> PodcastEpisode-CONTENT->Paragraph(first)
             |>> Person-IS_GUEST_ON->PodcastEpisode
             |>> Person-IS_HOST_OF->PodcastEpisode
+
 
         - Paragraph / Utterance / Speech
             |text
@@ -93,6 +137,7 @@ class Planning:
             |
             |>> Paragraph-SPOKEN_BY->Person
 
+
     We now have a LEXICAL graph.
 
     - Then, start to find entities, relationships:
@@ -103,6 +148,7 @@ class Planning:
         - Organisation
         - Country
         - Concept (våpenhvile, energi)
+
 
         DBPedia Ontology (add dbpedia_uri (eg. http://dbpedia.org/resource/Odessa) to everything)
         + Country
@@ -191,7 +237,7 @@ class Podcast:
         return self.PodcastEpisodes
 
     def save(self):
-        records, summary, keys = memgraph.execute_query(
+        records, summary, keys = memgraph_query(
             """
             MERGE (p:Podcast {url: $url}) 
             SET p.title = $title, 
@@ -206,7 +252,7 @@ class Podcast:
 
     def load(self):
         logging.info(f"Loading Podcast node for URL: {self.url}")
-        records, summary, keys = memgraph.execute_query(
+        records, summary, keys = memgraph_query(
             """
             MATCH (p:Podcast) 
             WHERE p.url = $url 
@@ -246,7 +292,7 @@ class PodcastEpisode:
         """
         logging.info(f"Saving PodcastEpisode node for URL: {self.url}")
 
-        records, summary, keys = memgraph.execute_query(
+        records, summary, keys = memgraph_query(
             query,
             url=self.url,
             podcast_url=self.podcast.url,
@@ -260,7 +306,7 @@ class PodcastEpisode:
 
     def load(self):
         logging.info(f"Loading PodcastEpisode node for URL: {self.url}")
-        records, summary, keys = memgraph.execute_query(
+        records, summary, keys = memgraph_query(
             """
             MATCH (pe:PodcastEpisode) 
             WHERE pe.url = $url 
@@ -281,6 +327,8 @@ class PodcastEpisode:
             "cookiesfrombrowser": ("brave", "default", "BASICTEXT"),
             # "cookiefile": "youtube.cookie"
             "postprocessor_hooks": [self.post_download_hook],
+            "quiet": True,
+            "noprogress": True,
         }
 
         with YoutubeDL(ydl_opts) as ydl:
@@ -336,6 +384,7 @@ class PodcastEpisode:
 
         if self._properties.get("paragraphs") and not overwrite:
             logging.info("Paragraphs already exist. Skipping post-processing.")
+            self._create_transcript_node()  # cleanup
             return
 
         smooth_operator = dspy.ChainOfThought(SmoothTranscription)
@@ -362,6 +411,19 @@ class PodcastEpisode:
             paragraphs.append(turn)
 
         self._properties["paragraphs"] = paragraphs
+
+        self._create_transcript_node()
+
+    def _create_transcript_node(self):
+        """Remove transcript from properties, and store as Transcript node instead."""
+        transcript = Transcript(
+            properties=self._properties["transcript"], podcast_episode=self
+        )
+
+        self._save_queue.append(transcript)
+
+        # also delete transcript from properties to avoid duplication
+        self._properties["transcript"] = None
 
     def define_speakers(self, overwrite: bool = False):
         """
@@ -548,6 +610,37 @@ class PodcastEpisode:
         return combined_turns
 
 
+class Transcript:
+    """Transcript node in the graph, representing the full transcript of a podcast episode."""
+
+    def __init__(self, properties: dict, podcast_episode: PodcastEpisode):
+        self._properties = properties
+        self.podcast_episode = podcast_episode
+
+    def save(self):
+        """Save Transcript node to Memgraph and create relationship to PodcastEpisode."""
+
+        # Build SET clause dynamically
+        set_clauses = [f"p.{key} = ${key}" for key in self._properties.keys()]
+        set_clause = ", ".join(set_clauses)
+
+        query = f"""
+        MERGE (t:Transcript {{podcast_episode_url: $podcast_episode_url}})
+        SET {set_clause}
+
+        MATCH (pe:PodcastEpisode {{url: $podcast_episode_url}})
+        MERGE (pe)-[:HAS_TRANSCRIPT]->(t)
+        RETURN t
+        """
+        records, summary, keys = memgraph_query(
+            query,
+            **self._properties,
+            podcast_episode_url=self.podcast_episode.url,
+        )
+
+        logging.info(f"Saved Transcript node for {self.podcast_episode.url}")
+
+
 class Person:
     """Person node in the graph, representing a speaker."""
 
@@ -581,7 +674,7 @@ class Person:
         RETURN p
         """
 
-        records, summary, keys = memgraph.execute_query(
+        records, summary, keys = memgraph_query(
             query,
             **self._properties,
         )
@@ -596,7 +689,7 @@ class Person:
                 "IS_HOST_OF" if self.role == "host" else "IS_GUEST_ON"
             )
 
-            memgraph.execute_query(
+            records, summary, keys = memgraph_query(
                 f"""
                 MATCH (p:Person {{full_name: $full_name}})
                 MATCH (pe:PodcastEpisode {{url: $podcast_episode_url}})
@@ -637,7 +730,7 @@ class Paragraph:
         RETURN p
         """
 
-        records, summary, keys = memgraph.execute_query(
+        records, summary, keys = memgraph_query(
             query,
             **self._properties,
             podcast_episode_url=self._podcast_episode.url,
@@ -649,7 +742,7 @@ class Paragraph:
 
         if not self._previous_paragraph:
             # Create relationship to PodcastEpisode
-            memgraph.execute_query(
+            memgraph_query(
                 """
                 MATCH (pe:PodcastEpisode {url: $podcast_episode_url})
                 MATCH (p:Paragraph {start: $start, end: $end, podcast_episode_url: $podcast_episode_url})
@@ -665,7 +758,7 @@ class Paragraph:
 
         if self._previous_paragraph:
             # Create relationship to previous Paragraph
-            memgraph.execute_query(
+            memgraph_query(
                 """
                 MATCH (p1:Paragraph {start: $prev_start, end: $prev_end, podcast_episode_url: $podcast_episode_url})
                 MATCH (p2:Paragraph {start: $start, end: $end, podcast_episode_url: $podcast_episode_url})
@@ -686,7 +779,7 @@ class Paragraph:
         if speaker_dict:
             full_name = speaker_dict.get("full_name")
             if full_name:
-                memgraph.execute_query(
+                memgraph_query(
                     """
                     MATCH (p:Paragraph {start: $start, end: $end, podcast_episode_url: $podcast_episode_url})
                     MATCH (person:Person {full_name: $full_name})
@@ -734,6 +827,9 @@ class Pipeline:
         # - add stats (word count, etc.)
         # - add audio clips (later)
         # - ENTITIES
+        # - enrich Person nodes with DBPedia URIs
+        # - clean up PodcastEpisode properties (too heavy)
+        # - Add Transcript node
 
         episodes = self.podcast.PodcastEpisodes
         if not episodes:
@@ -791,6 +887,9 @@ def init_memgraph():
         session.run(
             "CREATE CONSTRAINT ON (pe:PodcastEpisode) ASSERT pe.url IS UNIQUE"
         )
+        session.run(
+            "CREATE CONSTRAINT ON (pe:PodcastEpisode) ASSERT pe.url IS UNIQUE"
+        )
         logging.info("Created constraint for PodcastEpisode.")
 
         # Create index for Person
@@ -815,10 +914,11 @@ def main():
     podcast.fetch_meta()
     podcast.save()
     podcast.load()
+    podcast.load()
     episodes = podcast.load_episodes()
     logging.info(f"Podcast episodes: {len(episodes)}")
 
-    pipeline = Pipeline(podcast, max_episodes=30)
+    pipeline = Pipeline(podcast, max_episodes=100)
     pipeline.run_podcast()
 
 
