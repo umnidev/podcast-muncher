@@ -1,6 +1,7 @@
 from functools import wraps
 from yt_dlp import YoutubeDL
 import replicate
+from replicate.exceptions import ModelError
 import os
 import re
 import time
@@ -13,10 +14,12 @@ import yaml
 from pathlib import Path
 from pprint import pprint
 import dspy
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 import logging
 from neo4j import GraphDatabase
-from llm import SmoothTranscription, DefineSpeakers
+from neo4j.time import DateTime
+from llm import CleanTranscript, DefineSpeakers
+import concurrent.futures
 
 # memgraph running on host
 memgraph = GraphDatabase.driver(uri="bolt://localhost:7687", auth=("", ""))
@@ -26,9 +29,8 @@ logging.basicConfig(
     level=logging.INFO, format="{levelname} - {message}", style="{"
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)  # If using httpx
-logging.getLogger("httpcore").setLevel(
-    logging.WARNING
-)  # Also needed for httpx
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
 load_dotenv()
 
@@ -71,12 +73,8 @@ def memgraph_query(query: str, **params):
     """
     Execute a query against the Memgraph database.
     """
-    try:
-        records, summary, keys = memgraph.execute_query(query, **params)
-        return records, summary, keys
-    except Exception as e:
-        logging.error(f"Error executing graph query: {e}")
-        return [], None, None
+    records, summary, keys = memgraph.execute_query(query, **params)
+    return records, summary, keys
 
 
 class Planning:
@@ -114,8 +112,6 @@ class Planning:
             |description
             |length
             |url
-            |_t11n_raw (raw json from replicate)
-            |_t11n_clean (cleaned up transcription, into paragraphs)
             |
             |>> PodcastEpisode-CONTENT->Paragraph(first)
             |>> Person-IS_GUEST_ON->PodcastEpisode
@@ -148,7 +144,6 @@ class Planning:
         - Organisation
         - Country
         - Concept (våpenhvile, energi)
-
 
         DBPedia Ontology (add dbpedia_uri (eg. http://dbpedia.org/resource/Odessa) to everything)
         + Country
@@ -185,6 +180,29 @@ class Planning:
         - spokenBy
         - hasTimestamp
         - hasConfidence
+
+
+    GRAPHICAL USER INTERFACE
+    - showing podcast episodes
+        - easy reading of paragraphs (and easy choice of one sentence, few sentences, full text)
+    - search for topics, entities, where they are mentioned. return text snippets, with links
+      to full text, or directly to podcast episode at timestamp.
+    - semantic search, returning paragraphs that discuss search query
+
+    Return objects:
+    - Paragraph
+        - text
+        - one_sentence
+        - few_sentences
+        - timestamp (start, end)
+        - word by word text (with timestamps)
+        - reference to PodcastEpisode
+        - reference to Person(s)
+        - entities (list of entities mentioned in the paragraph)
+        - triples (list of triples extracted from the paragraph, ie. edges)
+
+
+
     """
 
 
@@ -232,6 +250,7 @@ class Podcast:
                     "description": entry.get("description"),
                 },
             )
+            episode.load()
             self.PodcastEpisodes.append(episode)
 
         return self.PodcastEpisodes
@@ -242,7 +261,8 @@ class Podcast:
             MERGE (p:Podcast {url: $url}) 
             SET p.title = $title, 
                 p.description = $description, 
-                p.meta = $meta 
+                p.meta = $meta,
+                p.updated_at = datetime()
             RETURN p
             """,
             url=self.url,
@@ -263,6 +283,56 @@ class Podcast:
         )
         if records and len(records):
             self._properties = records[0]["p"]._properties
+            return self
+
+
+class Transcript:
+    """Transcript node in the graph, representing the full transcript of a podcast episode."""
+
+    def __init__(self, podcast_episode_url: str, properties: dict = {}):
+        self._properties = properties
+        self.podcast_episode_url = podcast_episode_url
+
+    def save(self):
+        """Save Transcript node to Memgraph and create relationship to PodcastEpisode."""
+
+        # Build SET clause dynamically
+        set_clause = ", ".join(
+            [f"t.{key} = ${key}" for key in self._properties.keys()]
+            + ["t.updated_at = datetime()"]
+        )
+
+        logging.info(f"Saving Transcript node for {self.podcast_episode_url}.")
+
+        query = f"""
+        MERGE (t:Transcript {{podcast_episode_url: $podcast_episode_url}})
+        SET {set_clause}
+        WITH t
+
+        MATCH (pe:PodcastEpisode {{url: $podcast_episode_url}})
+        MERGE (pe)-[:HAS_TRANSCRIPT {{updated_at: datetime()}}]->(t)
+        RETURN t
+        """
+        records, summary, keys = memgraph_query(
+            query,
+            **self._properties,
+            podcast_episode_url=self.podcast_episode_url,
+        )
+
+        logging.info(f"Saved Transcript node for {self.podcast_episode_url}")
+
+    def load(self) -> "Transcript":
+        records, summary, keys = memgraph_query(
+            """
+            MATCH (t:Transcript {podcast_episode_url: $podcast_episode_url}) 
+            RETURN t 
+            LIMIT 1
+            """,
+            podcast_episode_url=self.podcast_episode_url,
+        )
+        if records and len(records):
+            self._properties = records[0]["t"]._properties
+            return self
 
 
 class PodcastEpisode:
@@ -279,15 +349,18 @@ class PodcastEpisode:
             return
 
         # Build SET clause dynamically - use 'pe' to match the MERGE variable
-        set_clauses = [f"pe.{key} = ${key}" for key in self._properties.keys()]
-        set_clause = ", ".join(set_clauses)
+        set_clause = ", ".join(
+            [f"pe.{key} = ${key}" for key in self._properties.keys()]
+            + ["pe.updated_at = datetime()"]
+        )
 
         query = f"""
         MERGE (pe:PodcastEpisode {{url: $url}}) 
         SET {set_clause}
         WITH pe
+
         MATCH (p:Podcast {{url: $podcast_url}})
-        MERGE (p)-[:HAS_EPISODE]->(pe)
+        MERGE (p)-[:HAS_EPISODE {{updated_at: datetime()}}]->(pe)
         RETURN pe
         """
         logging.info(f"Saving PodcastEpisode node for URL: {self.url}")
@@ -317,9 +390,15 @@ class PodcastEpisode:
         )
         if records and len(records):
             self._properties = records[0]["pe"]._properties
+            return self
 
-    def download(self):
+    def download(self, overwrite: bool = False):
         """Download episode using yt-dlp. Save to file."""
+
+        transcript = Transcript(podcast_episode_url=self.url).load()
+        if transcript and not overwrite:
+            logging.info("Already downloaded. Skipping!")
+            return
 
         ydl_opts = {
             "paths": {"home": "downloads"},
@@ -340,21 +419,24 @@ class PodcastEpisode:
     def transcribe(self, overwrite: bool = False):
         """
         Transcribe using Replicate interference.
-        See https://replicate.com/predictions?prediction=8e1g02sdj1rj60crc8ar2kpz4m for progress
+        See https://replicate.com/predictions?prediction=8e1g02sdj1rj60crc8ar2kpz4m for model details
         """
 
-        if self._properties.get("transcript") and not overwrite:
+        transcript = Transcript(podcast_episode_url=self.url).load()
+        if transcript and not overwrite:
             logging.info("Transcript already exists. Skipping!")
             return
 
         logging.info(f"Transcribing {self._properties.get('title')}...")
 
-        transcript = replicate.run(
-            "victor-upmeet/whisperx:84d2ad2d6194fe98a17d2b60bef1c7f910c46b2f6fd38996ca457afd9c8abfcb",
+        model = replicate.models.get(os.getenv("TRANSCRIPTION_MODEL"))
+        version = model.versions.get(os.getenv("TRANSCRIPTION_MODEL_VERSION"))
+        prediction = replicate.predictions.create(
+            version=version,
             input={
                 "debug": False,
                 "vad_onset": 0.5,
-                "audio_file": f"{os.getenv("NGROK_URL")}/{self.get_filename()}",
+                "audio_file": f"{os.getenv("NGROK_URL")}/{self._get_filename()}",
                 "batch_size": 64,
                 "vad_offset": 0.363,
                 "diarization": True,
@@ -368,30 +450,55 @@ class PodcastEpisode:
             },
         )
 
-        if not transcript:
-            raise Exception("Transcription failed.")
+        while prediction.status not in ["succeeded", "failed"]:
+            logging.info(
+                f"Transcription status: {prediction.status}. Waiting for completion..."
+            )
+            time.sleep(5)
+            prediction.reload()
 
-        self._properties["transcript"] = transcript
+        if prediction.status == "succeeded":
+            pred_transcript = prediction.output
+        if prediction.status == "failed":
+            raise ModelError(
+                prediction=prediction,
+                message="Transcription failed",
+                logs=prediction.logs,
+            )
 
-    def post_process_transcription(self, overwrite: bool = False):
+        if not pred_transcript:
+            raise Exception(f"Transcription failed. No transcript returned.")
+
+        self._save_queue.append(
+            Transcript(
+                podcast_episode_url=self.url, properties=pred_transcript
+            )
+        )
+
+        self.save()
+
+    def process_transcription(
+        self, overwrite: bool = False, overwrite_if_stale: bool = False
+    ):
         """
         Post-process transcription to combine speaker turns into paragraphs,
         and clean up the text using a language model.
         This will also add summaries to each paragraph.
         """
-        if not self._properties.get("transcript"):
-            raise Exception("No transcript to post-process.")
 
         if self._properties.get("paragraphs") and not overwrite:
-            logging.info("Paragraphs already exist. Skipping post-processing.")
-            self._create_transcript_node()  # cleanup
+            logging.info("Paragraphs already exist. Skipping!")
             return
 
-        smooth_operator = dspy.ChainOfThought(SmoothTranscription)
+        transcript = Transcript(podcast_episode_url=self.url).load()
+        if not transcript:
+            raise Exception("No transcript to post-process.")
+
+        cleaner = dspy.ChainOfThought(CleanTranscript)
 
         paragraphs = []
-        for turn in self._combine_turns():
-            pred = smooth_operator(
+        for turn in self._combine_turns(transcript._properties):
+            pred = cleaner(
                 speech=turn["speech"],
                 context=f"Episode description: {self._properties.get('description', '')}",
             )
@@ -400,30 +507,77 @@ class PodcastEpisode:
             turn["one_sentence"] = pred.one_sentence
             turn["few_sentences"] = pred.few_sentences
 
-            print("----start-----")
-            print(f"\nspeaker: {turn['speaker']}")
-            print(f"\nspeech: {turn["speech"]}")
-            print(f"\ntext: {pred.text}")
-            print(f"\none_sentence: {pred.one_sentence}")
-            print(f"\nfew_sentences: {pred.few_sentences}")
-            print("----end-----")
+            print("\n----------------- start of turn -----------------")
+            print(f"# speaker: {turn['speaker']}")
+            print(f"---\n# speech: {turn["speech"]}")
+            print(f"---\n# text: {pred.text}")
+            print(f"---\n# one_sentence: {pred.one_sentence}")
+            print(f"---\n# few_sentences: {pred.few_sentences}")
+            print("=================================================")
 
             paragraphs.append(turn)
 
         self._properties["paragraphs"] = paragraphs
 
-        self._create_transcript_node()
+        self.save()
 
-    def _create_transcript_node(self):
-        """Remove transcript from properties, and store as Transcript node instead."""
-        transcript = Transcript(
-            properties=self._properties["transcript"], podcast_episode=self
+    def _combine_turns(self, transcript: dict) -> list[dict]:
+        """Combine speaker turns into one full turn."""
+
+        logging.info("Combining speaker turns into paragraphs...")
+
+        turns = transcript.get("segments", [])
+
+        combined_turns = []
+        current_texts = []
+        prev_turn = None
+        for turn in turns:
+
+            # first round
+            if not prev_turn:
+                prev_turn = turn
+                start_of_combined_turn = turn["start"]
+                current_texts.append(turn["text"])
+                continue
+
+            # same speaker, continue
+            if (
+                prev_turn.get("speaker") == turn.get("speaker")
+                and len(turn.get("speaker", "")) > 0
+            ):
+                prev_turn = turn
+                current_texts.append(turn.get("text"))
+                continue
+
+            # new speaker, record combined turn
+            else:
+
+                # store combined turn
+                combined_turns.append(
+                    {
+                        "end": prev_turn.get("end"),
+                        "speaker": prev_turn.get("speaker"),
+                        "start": start_of_combined_turn,
+                        "speech": " ".join(current_texts),
+                    }
+                )
+
+                # mark new start
+                start_of_combined_turn = turn.get("start")
+                current_texts = [turn.get("text")]
+                prev_turn = turn
+
+        # last turn
+        combined_turns.append(
+            {
+                "end": prev_turn.get("end"),
+                "speaker": prev_turn.get("speaker"),
+                "start": start_of_combined_turn,
+                "speech": " ".join(current_texts),
+            }
         )
 
-        self._save_queue.append(transcript)
-
-        # also delete transcript from properties to avoid duplication
-        self._properties["transcript"] = None
+        return combined_turns
 
     def define_speakers(self, overwrite: bool = False):
         """
@@ -471,6 +625,8 @@ class PodcastEpisode:
         # Ensure speakers are added to paragraphs
         self._ensure_speakers_in_paragraphs()
 
+        self.save()
+
     def _ensure_speakers_in_paragraphs(self):
         """
         Ensure that speakers are added to paragraphs.
@@ -487,7 +643,7 @@ class PodcastEpisode:
                 if speaker:
                     para["speaker"] = speaker
 
-    def paragraphize(self):
+    def paragraphize(self, overwrite: bool = False):
         """
         Create Paragraph nodes from the transcript.
         Each paragraph is a single speaker turn, combined if necessary.
@@ -527,6 +683,8 @@ class PodcastEpisode:
             self._save_queue.append(paragraph)
             previous_paragraph = paragraph
 
+        self.save()
+
     def post_download_hook(self, info):
         """Post-download hook for yt-dlp to store metadata after download."""
         if info.get("status") == "finished":
@@ -541,104 +699,11 @@ class PodcastEpisode:
                     "display_id": info["info_dict"]["display_id"],
                 }
             )
-            logging.info(
-                f"Downloaded successfully. Filename: {self._properties['filename']}"
-            )
 
-    def get_filename(self):
+    def _get_filename(self):
         """Extract filename from the full path stored in post_download_hook"""
         filename = self._properties.get("filename")
         return os.path.basename(filename)
-
-    def _combine_turns(self) -> list[dict]:
-        """Combine speaker turns into one full turn."""
-
-        logging.info("Combining speaker turns into paragraphs...")
-
-        transcript = self._properties.get("transcript")
-        turns = transcript.get("segments", [])
-
-        combined_turns = []
-        current_texts = []
-        prev_turn = None
-        for turn in turns:
-
-            # first round
-            if not prev_turn:
-                prev_turn = turn
-                start_of_combined_turn = turn["start"]
-                current_texts.append(turn["text"])
-                continue
-
-            # same speaker, continue
-            if (
-                prev_turn.get("speaker") == turn.get("speaker")
-                and len(turn.get("speaker", "")) > 0
-            ):
-                prev_turn = turn
-                current_texts.append(turn.get("text"))
-                continue
-
-            # new speaker, record combined turn
-            else:
-
-                # store combined turn
-                combined_turns.append(
-                    {
-                        "end": prev_turn.get("end"),
-                        "speaker": prev_turn.get("speaker"),
-                        "start": start_of_combined_turn,
-                        "speech": " ".join(current_texts),
-                    }
-                )
-
-                # mark new start
-                start_of_combined_turn = turn.get("start")
-                current_texts = []
-                prev_turn = turn
-
-        # last turn
-        combined_turns.append(
-            {
-                "end": prev_turn.get("end"),
-                "speaker": prev_turn.get("speaker"),
-                "start": start_of_combined_turn,
-                "speech": " ".join(current_texts),
-            }
-        )
-
-        return combined_turns
-
-
-class Transcript:
-    """Transcript node in the graph, representing the full transcript of a podcast episode."""
-
-    def __init__(self, properties: dict, podcast_episode: PodcastEpisode):
-        self._properties = properties
-        self.podcast_episode = podcast_episode
-
-    def save(self):
-        """Save Transcript node to Memgraph and create relationship to PodcastEpisode."""
-
-        # Build SET clause dynamically
-        set_clauses = [f"p.{key} = ${key}" for key in self._properties.keys()]
-        set_clause = ", ".join(set_clauses)
-
-        query = f"""
-        MERGE (t:Transcript {{podcast_episode_url: $podcast_episode_url}})
-        SET {set_clause}
-
-        MATCH (pe:PodcastEpisode {{url: $podcast_episode_url}})
-        MERGE (pe)-[:HAS_TRANSCRIPT]->(t)
-        RETURN t
-        """
-        records, summary, keys = memgraph_query(
-            query,
-            **self._properties,
-            podcast_episode_url=self.podcast_episode.url,
-        )
-
-        logging.info(f"Saved Transcript node for {self.podcast_episode.url}")
 
 
 class Person:
@@ -663,10 +728,10 @@ class Person:
             for k, v in self._properties.items()
             if k not in ["role", "speaker_id"]
         }
-        set_clauses = [
-            f"p.{key} = ${key}" for key in filtered_properties.keys()
-        ]
-        set_clause = ", ".join(set_clauses)
+        set_clause = ", ".join(
+            [f"p.{key} = ${key}" for key in filtered_properties.keys()]
+            + ["p.updated_at = datetime()"]
+        )
 
         query = f"""
         MERGE (p:Person {{full_name: $full_name}})
@@ -721,8 +786,10 @@ class Paragraph:
         """Save Paragraph node to Memgraph and create relationships."""
 
         # Build SET clause dynamically
-        set_clauses = [f"p.{key} = ${key}" for key in self._properties.keys()]
-        set_clause = ", ".join(set_clauses)
+        set_clause = ", ".join(
+            [f"p.{key} = ${key}" for key in self._properties.keys()]
+            + ["p.updated_at = datetime()"]
+        )
 
         query = f"""
         MERGE (p:Paragraph {{start: $start, end: $end, podcast_episode_url: $podcast_episode_url}})
@@ -803,46 +870,64 @@ class Sentence:
 
 
 class Pipeline:
-    def __init__(self, podcast: Podcast, max_episodes: int = 3):
+    def __init__(
+        self, podcast: Podcast, max_episodes: int = 3, max_workers: int = 5
+    ):
         self.podcast = podcast
         self.max_episodes = max_episodes
+        self.max_workers = max_workers
 
     def run_podcast(self):
 
-        # get list of episodes from podcast (already stored in metadata)
-        # create PodcastEpisode class
-        # create Person's (host, guests)
-        # get full metadata of episode
-        # download audio of episode as wav (to tmp file)
-        # transcribe using Replicate API (needs file hosted with ngrok)
-        # clean up and process transcription & diarization using LLM
-        # identify SPEAKER -> Person
-        # create Paragraph's
-        # store Nodes
-        # store Edges
-        # --
         # TODO:
-        # - clean paragraphs before LLM processing
+        # - √ clean up PodcastEpisode properties (too heavy)
+        # - √ Add Transcript node
         # - create embeddings of all text
-        # - add stats (word count, etc.)
-        # - add audio clips (later)
-        # - ENTITIES
+        #   > on paragraphs (text, one_sentence, few_sentences)
+        #   > on person (full_name + description)
+        #   > on podcast_episode (title + description)
+        # - add stats (word count, sentence count)
         # - enrich Person nodes with DBPedia URIs
-        # - clean up PodcastEpisode properties (too heavy)
-        # - Add Transcript node
+        # - ENTITIES
+        # - add audio clips (later)
+        # FIXME: bugs
+        # - when two or more speakers, issue with parsing
+        # - Person node without name should not be created
 
         episodes = self.podcast.PodcastEpisodes
         if not episodes:
             episodes = self.podcast.load_episodes()
 
+        # Filter out episodes that are already processed
+        logging.info(
+            f"Filtering episodes that are already processed... Total: {len(episodes)}"
+        )
+        episodes = [
+            episode
+            for episode in episodes
+            if not episode._properties.get("updated_at")
+        ]
+        logging.info(f"Filtered episodes: {len(episodes)}")
+
         logging.info(
             f"Pipeline episodes: {len(episodes)}. Handling {self.max_episodes} episodes."
         )
 
-        for episode in episodes[: self.max_episodes]:
-            self.run_episode_tasks(episode)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_workers
+        ) as executor:
+            futures = [
+                executor.submit(self.run_episode_tasks, episode)
+                for episode in episodes[: self.max_episodes]
+            ]
+
+        concurrent.futures.wait(futures)
 
     def run_episode_tasks(self, episode: PodcastEpisode):
+        logging.info("")
+        logging.info(f">>>>>>>>>>>>>>")
+        logging.info(f">> Pipeline: Running episode: {episode.url}")
+        logging.info(f">>>>>>>>>>>>>>")
 
         try:
 
@@ -855,19 +940,18 @@ class Pipeline:
             episode.transcribe()
 
             # clean up transcription / diarization
-            episode.post_process_transcription()
+            episode.process_transcription(overwrite=True)
 
             # define Person nodes (host, guests)
-            episode.define_speakers()
-
-            # save episode to graph
-            episode.save()
+            episode.define_speakers(overwrite=True)
 
             # create Paragraph nodes from transcription
-            episode.paragraphize()
+            episode.paragraphize(overwrite=True)
 
-            # save episode to graph
-            episode.save()
+            # create embeddings for all text
+            # episode.create_embeddings(overwrite=True)
+
+            # create statistics
 
         except Exception as e:
             logging.exception(f"Error processing episode {episode.url}: {e}")
@@ -914,11 +998,10 @@ def main():
     podcast.fetch_meta()
     podcast.save()
     podcast.load()
-    podcast.load()
     episodes = podcast.load_episodes()
     logging.info(f"Podcast episodes: {len(episodes)}")
 
-    pipeline = Pipeline(podcast, max_episodes=100)
+    pipeline = Pipeline(podcast, max_episodes=300, max_workers=20)
     pipeline.run_podcast()
 
 

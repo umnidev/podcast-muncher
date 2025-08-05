@@ -1,18 +1,24 @@
 import dspy
 
 
-class SmoothTranscription(dspy.Signature):
+class CleanTranscript(dspy.Signature):
     """
-    Minimally clean transcription. Make it more legible, but keep it as close to original as possible.
-    Fix grammatical errors and transcription errors.
-    Make sure NOT to leave out ANY significant detail from the transcript, ie. names, meanings.
+    Clean up transcript.
+    - Keep it as close to original as possible.
+    - Fix grammatical errors and transcription errors.
+    - Make sure NOT to leave out ANY significant detail from the transcript, ie. names, meanings, numbers.
 
-    Also add short- and long versions of the transcript, as if the speaker were more succinct.
+    Return the cleaned, unabridged transcript, and two condensed versions:
+    - one_sentence: Text condensed to a single sentence, as if the speaker said only this sentence.
+    - few_sentences: Text condensed to maximum three sentences, as if the speaker said only this.
     """
 
     speech: str = dspy.InputField()
     context: str = dspy.InputField()
-    text: str = dspy.OutputField()
+
+    text: str = dspy.OutputField(
+        desc="Cleaned, unabridged transcript of the speech."
+    )
     one_sentence: str = dspy.OutputField(
         desc="Text condensed to a single sentence, as if the speaker said only this sentence. "
     )
@@ -37,6 +43,13 @@ class DefineSpeakers(dspy.Signature):
     - role: Role of the speaker (e.g., host, guest)
     - speaker_id: Unique identifier for the speaker in the transcript, eg. SPEAKER_01
     - description: Short description of the speaker (optional)
+    - description_long: Long description of the speaker (optional)
+    - subsctack_url: URL to the speaker's Substack profile (optional)
+    - linkedin_url: URL to the speaker's LinkedIn profile (optional)
+    - twitter_url: URL to the speaker's Twitter profile (optional)
+    - youtube_url: URL to the speaker's YouTube profile/channel (optional)
+    - patreon_url: URL to the speaker's Patreon profile (optional)
+    - paypal_url: URL to the speaker's PayPal profile (optional)
     """
 
     context: str = dspy.InputField(
