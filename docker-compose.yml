@@ -10,9 +10,11 @@ services:
     restart: always
     command:
       - "--log-level=INFO"
+      - "--also-log-to-stderr"
       - "--query-execution-timeout-sec=600"
       - "--storage-snapshot-interval-sec=300"
-      - "--also-log-to-stderr=true"
+      - "--cartesian-product-enabled=false"
+      - "--telemetry-enabled=false"
 
   lab:
     image: memgraph/lab:latest

@@ -1,7 +1,7 @@
 from functools import wraps
 from yt_dlp import YoutubeDL
 import replicate
-from replicate.exceptions import ModelError
+from replicate.exceptions import ReplicateError
 import os
 import re
 import time
@@ -20,6 +20,9 @@ from neo4j import GraphDatabase
 from neo4j.time import DateTime
 from llm import CleanTranscript, DefineSpeakers
 import concurrent.futures
+import secrets
+import string
+
 
 # memgraph running on host
 memgraph = GraphDatabase.driver(uri="bolt://localhost:7687", auth=("", ""))
@@ -34,8 +37,18 @@ logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
 load_dotenv()
 
-lm = dspy.LM("openai/gpt-4.1-2025-04-14", api_key=os.getenv("OPENAI_API_KEY"))
+lm = dspy.LM(
+    "openai/gpt-4.1-2025-04-14",
+    api_key=os.getenv("OPENAI_API_KEY"),
+    max_tokens=32768,
+)
 dspy.configure(lm=lm)
+
+
+def random_string(length: int = 10) -> str:
+    """Generate a random string of fixed length."""
+    letters = string.ascii_letters + string.digits
+    return "".join(secrets.choice(letters) for _ in range(length))
 
 
 def retry_on_failure(max_retries=3, delay=1.0, exponential_backoff=True):
@@ -285,6 +298,16 @@ class Podcast:
             self._properties = records[0]["p"]._properties
             return self
 
+    def get_episode(self, url: str) -> "PodcastEpisode":
+        """
+        Get a PodcastEpisode by its URL.
+        If it doesn't exist, return None.
+        """
+        for episode in self.PodcastEpisodes:
+            if episode.url == url:
+                return episode
+        return None
+
 
 class Transcript:
     """Transcript node in the graph, representing the full transcript of a podcast episode."""
@@ -310,7 +333,8 @@ class Transcript:
         WITH t
 
         MATCH (pe:PodcastEpisode {{url: $podcast_episode_url}})
-        MERGE (pe)-[:HAS_TRANSCRIPT {{updated_at: datetime()}}]->(t)
+        MERGE (pe)-[ht:HAS_TRANSCRIPT]->(t)
+        SET ht.updated_at = datetime()
         RETURN t
         """
         records, summary, keys = memgraph_query(
@@ -360,7 +384,8 @@ class PodcastEpisode:
         WITH pe
 
         MATCH (p:Podcast {{url: $podcast_url}})
-        MERGE (p)-[:HAS_EPISODE {{updated_at: datetime()}}]->(pe)
+        MERGE (p)-[he:HAS_EPISODE]->(pe)
+        SET he.updated_at = datetime()
         RETURN pe
         """
         logging.info(f"Saving PodcastEpisode node for URL: {self.url}")
@@ -378,11 +403,10 @@ class PodcastEpisode:
         self._save_queue = []  # Clear the queue after saving
 
     def load(self):
-        logging.info(f"Loading PodcastEpisode node for URL: {self.url}")
         records, summary, keys = memgraph_query(
             """
             MATCH (pe:PodcastEpisode) 
-            WHERE pe.url = $url 
+            WHERE pe.url = $url
             RETURN pe 
             LIMIT 1
             """,
@@ -445,8 +469,9 @@ class PodcastEpisode:
                 "max_speakers": 3,  # TODO: set dynamically
                 "min_speakers": 1,
                 "huggingface_access_token": os.getenv("HUGGINGFACE_TOKEN"),
-                "language_detection_min_prob": 0,
-                "language_detection_max_tries": 5,
+                "language": "en",
+                "language_detection_min_prob": 0.8,
+                "language_detection_max_tries": 3,
             },
         )
 
@@ -460,10 +485,10 @@ class PodcastEpisode:
         if prediction.status == "succeeded":
             pred_transcript = prediction.output
         if prediction.status == "failed":
-            raise ModelError(
+            raise ReplicateError(
                 prediction=prediction,
-                message="Transcription failed",
-                logs=prediction.logs,
+                title="Transcription failed",
+                detail=prediction.logs,
             )
 
         if not pred_transcript:
@@ -477,7 +502,7 @@ class PodcastEpisode:
 
         self.save()
 
-    def process_transcription(
+    def cleanup_transcription(
         self, overwrite: bool = False, overwrite_if_stale: bool = False
     ):
         """
@@ -497,7 +522,9 @@ class PodcastEpisode:
         cleaner = dspy.ChainOfThought(CleanTranscript)
 
         paragraphs = []
-        for turn in self._combine_turns(transcript._properties):
+        turns = self._combine_turns(transcript._properties)
+        logging.info(f"Combined speaker turns into {len(turns)} paragraphs.")
+        for turn in turns:
             pred = cleaner(
                 speech=turn["speech"],
                 context=f"Episode description: {self._properties.get('description', '')}",
@@ -508,12 +535,12 @@ class PodcastEpisode:
             turn["few_sentences"] = pred.few_sentences
 
             print("\n----------------- start of turn -----------------")
-            print(f"# speaker: {turn['speaker']}")
-            print(f"---\n# speech: {turn["speech"]}")
-            print(f"---\n# text: {pred.text}")
-            print(f"---\n# one_sentence: {pred.one_sentence}")
-            print(f"---\n# few_sentences: {pred.few_sentences}")
-            print("=================================================")
+            print(f"\n-> speaker: \n{turn['speaker']}")
+            print(f"\n-> speech: \n{turn["speech"]}")
+            print(f"\n-> text: \n{pred.text}")
+            print(f"\n-> one_sentence: \n{pred.one_sentence}")
+            print(f"\n-> few_sentences: \n{pred.few_sentences}")
+            print("==================== end ==========================")
 
             paragraphs.append(turn)
 
@@ -543,7 +570,10 @@ class PodcastEpisode:
             # same speaker, continue
             if (
                 prev_turn.get("speaker") == turn.get("speaker")
+                # filter out empty speaker names
                 and len(turn.get("speaker", "")) > 0
+                # Limit to 100 turns per paragraph
+                and len(current_texts) < 100
             ):
                 prev_turn = turn
                 current_texts.append(turn.get("text"))
@@ -597,22 +627,47 @@ class PodcastEpisode:
         )
 
         context = f"""
+        Podcast title: {self.podcast._properties.get("title", "No title provided.")}
+        Podcast description: {self.podcast._properties.get("description", "No description provided.")}
+        --
         Podcast episode title: {self._properties.get("title", "Unknown Title")}
         Podcast episode description: {self._properties.get("description", "No description provided.")}
+        --
         First few paragraphs of the transcript:
-        {self._properties.get("paragraphs", {})[:2]}  # Show only first 3 paragraphs for context
+        {self._properties.get("paragraphs", {})[:5]}
         """
+
+        # TODO: Add check for expected number of speakers based on PodcastEpisode properties
+        #       then check if all speakers are identified in the transcript
+        #       if not, then do another run, but with all paragraphs in context
+
+        logging.info(f"Context for speaker definition: {context}")
 
         speaker_definer = dspy.ChainOfThought(DefineSpeakers)
         pred = speaker_definer(context=context)
+
+        logging.info(f"Predicted speakers: {pred}")
 
         if not pred.speakers:
             raise Exception("No speakers defined in the transcript.")
 
         logging.info(f"Defined speakers: {pred.speakers}")
 
-        self._properties["speakers"] = pred.speakers
+        self._properties["speakers"] = [
+            speaker
+            for speaker in pred.speakers
+            if speaker.get("full_name") is not None
+        ]
 
+        logging.info(
+            f"""Defined {len(self._properties['speakers'])} speakers from the transcript: 
+            {self._properties['speakers']}"""
+        )
+
+        self.save()
+
+    def create_speakers(self, overwrite: bool = False):
+        """Create Person nodes for each speaker defined in the transcript."""
         for speaker in self._properties.get("speakers", []):
             # Create Person node and set episode relationship
             person = Person(
@@ -642,6 +697,12 @@ class PodcastEpisode:
                 )
                 if speaker:
                     para["speaker"] = speaker
+                else:
+                    para["speaker"] = {
+                        "full_name": f"Placeholder: {random_string(6)}",
+                        "description": "Warning: Not able to designate speaker. Speaker should still be connected to the PodcastEpisode.",
+                        "speaker_id": speaker_id,
+                    }
 
     def paragraphize(self, overwrite: bool = False):
         """
@@ -653,25 +714,18 @@ class PodcastEpisode:
         if not paragraphs:
             raise Exception("No paragraphs to create from.")
 
-        logging.info(
-            f"Creating Paragraph nodes for {len(paragraphs)} paragraphs..."
-        )
-
-        # clean up paragraphs, remove empty turns
-        logging.info(
-            f"Cleaning up paragraphs... {len(paragraphs)} paragraphs before cleanup."
-        )
         paragraphs = [
             para
             for para in paragraphs
             if len(para.get("speech")) and type(para.get("speaker")) is dict
         ]
-        logging.info(
-            f"Cleaning up paragraphs... {len(paragraphs)} paragraphs after cleanup."
-        )
 
         if not paragraphs:
             raise Exception("No paragraphs to create from.")
+
+        logging.info(
+            f"Creating Paragraph nodes for {len(paragraphs)} paragraphs..."
+        )
 
         previous_paragraph = None
         for para in paragraphs:
@@ -722,6 +776,10 @@ class Person:
     def save(self):
         """Save Person node to Memgraph and create relationships."""
 
+        if not self._properties.get("full_name"):
+            logging.warning("No full_name provided. Skipping save.")
+            return
+
         # Build SET clause dynamically
         filtered_properties = {
             k: v
@@ -758,7 +816,9 @@ class Person:
                 f"""
                 MATCH (p:Person {{full_name: $full_name}})
                 MATCH (pe:PodcastEpisode {{url: $podcast_episode_url}})
-                MERGE (p)-[:{relationship_type}]->(pe)
+                MERGE (p)-[rt:{relationship_type}]->(pe)
+                SET rt.updated_at = datetime()
+                RETURN p, pe
                 """,
                 full_name=self._properties["full_name"],
                 podcast_episode_url=self.podcast_episode.url,
@@ -813,14 +873,12 @@ class Paragraph:
                 """
                 MATCH (pe:PodcastEpisode {url: $podcast_episode_url})
                 MATCH (p:Paragraph {start: $start, end: $end, podcast_episode_url: $podcast_episode_url})
-                MERGE (pe)-[:FIRST_PARAGRAPH]->(p)
+                MERGE (pe)-[np:NEXT_PARAGRAPH]->(p)
+                SET np.updated_at = datetime()
                 """,
                 start=self._properties["start"],
                 end=self._properties["end"],
                 podcast_episode_url=self._podcast_episode.url,
-            )
-            logging.debug(
-                f"Created FIRST_PARAGRAPH relationship for {self._properties['start']}"
             )
 
         if self._previous_paragraph:
@@ -829,16 +887,14 @@ class Paragraph:
                 """
                 MATCH (p1:Paragraph {start: $prev_start, end: $prev_end, podcast_episode_url: $podcast_episode_url})
                 MATCH (p2:Paragraph {start: $start, end: $end, podcast_episode_url: $podcast_episode_url})
-            MERGE (p1)-[:NEXT_PARAGRAPH]->(p2)
-            """,
+                MERGE (p1)-[np:NEXT_PARAGRAPH]->(p2)
+                SET np.updated_at = datetime()
+                """,
                 start=self._properties["start"],
                 end=self._properties["end"],
                 prev_start=self._previous_paragraph._properties["start"],
                 prev_end=self._previous_paragraph._properties["end"],
                 podcast_episode_url=self._podcast_episode.url,
-            )
-            logging.debug(
-                f"Created NEXT_PARAGRAPH relationship for {self._properties['start']}"
             )
 
         # Create relationship to Person (SPOKEN_BY)
@@ -850,15 +906,13 @@ class Paragraph:
                     """
                     MATCH (p:Paragraph {start: $start, end: $end, podcast_episode_url: $podcast_episode_url})
                     MATCH (person:Person {full_name: $full_name})
-                    MERGE (p)-[:EXPRESSED_BY]->(person)
+                    MERGE (p)-[eb:SPOKEN_BY]->(person)
+                    SET eb.updated_at = datetime()
                     """,
                     start=self._properties["start"],
                     end=self._properties["end"],
                     podcast_episode_url=self._podcast_episode.url,
                     full_name=full_name,
-                )
-                logging.debug(
-                    f"Created EXPRESSED_BY relationship for {self._properties['start']} with speaker {full_name}"
                 )
 
 
@@ -891,23 +945,30 @@ class Pipeline:
         # - ENTITIES
         # - add audio clips (later)
         # FIXME: bugs
-        # - when two or more speakers, issue with parsing
-        # - Person node without name should not be created
+        # - √ when three or more speakers, issue with parsing
+        #   - how to solve?
+        #     a) use short video clip?
+        #     b) match audio with known audio of speakers?
+        #     c) look through whole transcript for hint to speaker name per turn?
+        #     ... tricky. need backup, ie. add paragraphs even without speakers
+        # - √ when only one speaker, issue with parsing (also will have too long paragraph)
+        # - √ Person node without name should not be created
+        # - √ clean up messy edges
 
         episodes = self.podcast.PodcastEpisodes
         if not episodes:
             episodes = self.podcast.load_episodes()
 
         # Filter out episodes that are already processed
-        logging.info(
-            f"Filtering episodes that are already processed... Total: {len(episodes)}"
-        )
-        episodes = [
-            episode
-            for episode in episodes
-            if not episode._properties.get("updated_at")
-        ]
-        logging.info(f"Filtered episodes: {len(episodes)}")
+        # logging.info(
+        #     f"Filtering episodes that are already processed... Total: {len(episodes)}"
+        # )
+        # episodes = [
+        #     episode
+        #     for episode in episodes
+        #     if not episode._properties.get("updated_at")
+        # ]
+        # logging.info(f"Filtered episodes: {len(episodes)}")
 
         logging.info(
             f"Pipeline episodes: {len(episodes)}. Handling {self.max_episodes} episodes."
@@ -940,13 +1001,16 @@ class Pipeline:
             episode.transcribe()
 
             # clean up transcription / diarization
-            episode.process_transcription(overwrite=True)
+            episode.cleanup_transcription()
 
-            # define Person nodes (host, guests)
-            episode.define_speakers(overwrite=True)
+            # define speakers
+            episode.define_speakers()
+
+            # create Person nodes for speakers
+            episode.create_speakers()
 
             # create Paragraph nodes from transcription
-            episode.paragraphize(overwrite=True)
+            episode.paragraphize()
 
             # create embeddings for all text
             # episode.create_embeddings(overwrite=True)
@@ -965,20 +1029,19 @@ def init_memgraph():
     with memgraph.session() as session:
         # Create constraint for Podcast
         session.run("CREATE CONSTRAINT ON (p:Podcast) ASSERT p.url IS UNIQUE")
-        logging.info("Created constraint for Podcast.")
-
-        # Create constraint for PodcastEpisode
         session.run(
             "CREATE CONSTRAINT ON (pe:PodcastEpisode) ASSERT pe.url IS UNIQUE"
         )
-        session.run(
-            "CREATE CONSTRAINT ON (pe:PodcastEpisode) ASSERT pe.url IS UNIQUE"
-        )
-        logging.info("Created constraint for PodcastEpisode.")
-
-        # Create index for Person
-        session.run("CREATE INDEX ON :Person(name)")
-        logging.info("Created index for Person.")
+        session.run("CREATE INDEX ON :Person")
+        session.run("CREATE INDEX ON :Person(full_name)")
+        session.run("CREATE INDEX ON :Transcript")
+        session.run("CREATE INDEX ON :Transcript(podcast_episode_url)")
+        session.run("CREATE INDEX ON :Paragraph")
+        session.run("CREATE INDEX ON :Paragraph(podcast_episode_url)")
+        session.run("CREATE INDEX ON :Paragraph(start)")
+        session.run("CREATE INDEX ON :Paragraph(end)")
+        session.run("CREATE INDEX ON :PodcastEpisode")
+        session.run("CREATE INDEX ON :PodcastEpisode(url)")
 
 
 def clear_memgraph():
@@ -1001,8 +1064,14 @@ def main():
     episodes = podcast.load_episodes()
     logging.info(f"Podcast episodes: {len(episodes)}")
 
-    pipeline = Pipeline(podcast, max_episodes=300, max_workers=20)
+    pipeline = Pipeline(podcast, max_episodes=300, max_workers=1)
     pipeline.run_podcast()
+
+    # episode = podcast.get_episode(
+    #     url="https://www.youtube.com/watch?v=SWux-RBbKGs"
+    # )
+    # if episode:
+    #     pipeline.run_episode_tasks(episode)
 
 
 if __name__ == "__main__":

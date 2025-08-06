@@ -40,7 +40,7 @@ class DefineSpeakers(dspy.Signature):
     - full_name: Full name of the speaker (last_name + first_name)
     - title: Title of the speaker (optional)
     - title_short: Short title of the speaker (optional)
-    - role: Role of the speaker (e.g., host, guest)
+    - role: Role of the speaker ('host' or 'guest')
     - speaker_id: Unique identifier for the speaker in the transcript, eg. SPEAKER_01
     - description: Short description of the speaker (optional)
     - description_long: Long description of the speaker (optional)
