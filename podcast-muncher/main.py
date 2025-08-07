@@ -137,14 +137,14 @@ class Planning:
             |timestamp (start/end)
             |
             |>> Paragraph-NEXT->Paragraph rel.
-            |>> Paragraph-SPOKEN_BY->Person
+            |>> Paragraph<-SAID-Person
 
         - Person
             |name
             |dbpedia_uri
             |profession
             |
-            |>> Paragraph-SPOKEN_BY->Person
+            |>> Paragraph<-SAID-Person
 
 
     We now have a LEXICAL graph.
@@ -416,11 +416,11 @@ class PodcastEpisode:
             self._properties = records[0]["pe"]._properties
             return self
 
-    def download(self, overwrite: bool = False):
+    def download(self, rerun: bool = False):
         """Download episode using yt-dlp. Save to file."""
 
         transcript = Transcript(podcast_episode_url=self.url).load()
-        if transcript and not overwrite:
+        if transcript and not rerun:
             logging.info("Already downloaded. Skipping!")
             return
 
@@ -440,14 +440,14 @@ class PodcastEpisode:
                 f"Downloaded {self._properties.get('title')} with error code: {error_code}"
             )
 
-    def transcribe(self, overwrite: bool = False):
+    def transcribe(self, rerun: bool = False):
         """
         Transcribe using Replicate interference.
         See https://replicate.com/predictions?prediction=8e1g02sdj1rj60crc8ar2kpz4m for model details
         """
 
         transcript = Transcript(podcast_episode_url=self.url).load()
-        if transcript and not overwrite:
+        if transcript and not rerun:
             logging.info("Transcript already exists. Skipping!")
             return
 
@@ -502,20 +502,19 @@ class PodcastEpisode:
 
         self.save()
 
-    def cleanup_transcription(
-        self, overwrite: bool = False, overwrite_if_stale: bool = False
-    ):
+    def summarize_transcript(self, rerun: bool = False):
         """
         Post-process transcription to combine speaker turns into paragraphs,
         and clean up the text using a language model.
         This will also add summaries to each paragraph.
         """
 
-        if self._properties.get("paragraphs") and not overwrite:
+        if self._properties.get("paragraphs") and not rerun:
             logging.info("Paragraphs already exist. Skipping!")
             return
 
         transcript = Transcript(podcast_episode_url=self.url).load()
+
         if not transcript:
             raise Exception("No transcript to post-process.")
 
@@ -523,7 +522,9 @@ class PodcastEpisode:
 
         paragraphs = []
         turns = self._combine_turns(transcript._properties)
+
         logging.info(f"Combined speaker turns into {len(turns)} paragraphs.")
+
         for turn in turns:
             pred = cleaner(
                 speech=turn["speech"],
@@ -609,22 +610,20 @@ class PodcastEpisode:
 
         return combined_turns
 
-    def define_speakers(self, overwrite: bool = False):
+    def define_speakers(self, rerun: bool = False):
         """
         Define Person nodes (host, guests) from the transcript.
         This will create Person nodes and connect them to the PodcastEpisode.
+        This will not connect paragraphs to speakers; this is done later.
         """
         if not self._properties.get("paragraphs"):
             raise Exception("No paragraphs to define speakers from.")
 
-        if self._properties.get("speakers") and not overwrite:
+        if self._properties.get("speakers") and not rerun:
             logging.info("Speakers already defined. Skipping.")
-            self._ensure_speakers_in_paragraphs()
             return
 
-        logging.info(
-            f"Defining speakers from the transcript... overwrite={overwrite}"
-        )
+        logging.info(f"Defining speakers from the transcript... rerun={rerun}")
 
         context = f"""
         Podcast title: {self.podcast._properties.get("title", "No title provided.")}
@@ -666,7 +665,7 @@ class PodcastEpisode:
 
         self.save()
 
-    def create_speakers(self, overwrite: bool = False):
+    def create_speakers(self, rerun: bool = False):
         """Create Person nodes for each speaker defined in the transcript."""
         for speaker in self._properties.get("speakers", []):
             # Create Person node and set episode relationship
@@ -678,46 +677,52 @@ class PodcastEpisode:
             self._save_queue.append(person)
 
         # Ensure speakers are added to paragraphs
-        self._ensure_speakers_in_paragraphs()
+        # self._ensure_speakers_in_paragraphs()
 
         self.save()
 
-    def _ensure_speakers_in_paragraphs(self):
-        """
-        Ensure that speakers are added to paragraphs.
-        """
-        speakers = self._properties.get("speakers", [])
-        for para in self._properties.get("paragraphs", []):
-            speaker_id = para.get("speaker")
-            if speaker_id:
-                # Find the speaker in the defined speakers
-                speaker = next(
-                    (s for s in speakers if s["speaker_id"] == speaker_id),
-                    None,
-                )
-                if speaker:
-                    para["speaker"] = speaker
-                else:
-                    para["speaker"] = {
-                        "full_name": f"Placeholder: {random_string(6)}",
-                        "description": "Warning: Not able to designate speaker. Speaker should still be connected to the PodcastEpisode.",
-                        "speaker_id": speaker_id,
-                    }
+    # def _ensure_speakers_in_paragraphs(self):
+    #     """
+    #     Ensure that speakers are added to paragraphs.
+    #     """
+    #     speakers = self._properties.get("speakers", [])
+    #     for para in self._properties.get("paragraphs", []):
+    #         speaker_id = para.get("speaker")
+    #         if speaker_id:
+    #             # Find the speaker in the defined speakers
+    #             speaker = next(
+    #                 (s for s in speakers if s["speaker_id"] == speaker_id),
+    #                 None,
+    #             )
+    #             if speaker:
+    #                 para["speaker"] = speaker
 
-    def paragraphize(self, overwrite: bool = False):
+    def paragraphize(self, rerun: bool = False):
         """
         Create Paragraph nodes from the transcript.
         Each paragraph is a single speaker turn, combined if necessary.
         """
         paragraphs = self._properties.get("paragraphs")
+        speakers = self._properties.get("speakers")
 
         if not paragraphs:
             raise Exception("No paragraphs to create from.")
 
+        for pg in paragraphs:
+            speaker_id = pg.get("speaker")
+            if type(speaker_id) == str and len(speaker_id) > 3:
+                speaker = next(
+                    (s for s in speakers if s["speaker_id"] == speaker_id),
+                    None,
+                )
+                if speaker:
+                    pg["speaker"] = speaker
+
         paragraphs = [
             para
             for para in paragraphs
-            if len(para.get("speech")) and type(para.get("speaker")) is dict
+            if len(para.get("speech"))
+            # and type(para.get("speaker")) is dict
         ]
 
         if not paragraphs:
@@ -758,6 +763,21 @@ class PodcastEpisode:
         """Extract filename from the full path stored in post_download_hook"""
         filename = self._properties.get("filename")
         return os.path.basename(filename)
+
+    def debug_clean_up_speakers(self):
+        paragraphs = self._properties.get("paragraphs", [])
+        for paragraph in paragraphs:
+            speaker = paragraph.get("speaker")
+            while speaker and type(speaker) == dict:
+                if (
+                    "speaker_id" in speaker
+                    and type(speaker["speaker_id"]) == dict
+                ):
+                    speaker = speaker["speaker_id"]
+                else:
+                    break
+            paragraph["speaker"] = speaker
+        self.save()
 
 
 class Person:
@@ -897,7 +917,7 @@ class Paragraph:
                 podcast_episode_url=self._podcast_episode.url,
             )
 
-        # Create relationship to Person (SPOKEN_BY)
+        # Create relationship to Person (SAID)
         speaker_dict = self._properties.get("speaker")
         if speaker_dict:
             full_name = speaker_dict.get("full_name")
@@ -906,7 +926,7 @@ class Paragraph:
                     """
                     MATCH (p:Paragraph {start: $start, end: $end, podcast_episode_url: $podcast_episode_url})
                     MATCH (person:Person {full_name: $full_name})
-                    MERGE (p)-[eb:SPOKEN_BY]->(person)
+                    MERGE (person)-[eb:SAID]->(p)
                     SET eb.updated_at = datetime()
                     """,
                     start=self._properties["start"],
@@ -921,6 +941,35 @@ class Sentence:
 
     def __init__(self, text: str):
         pass
+
+
+def debug_clean_up_speakers_in_paragraph_nodes():
+    logging.info("debug_clean_up_speakers_in_paragraph_nodes")
+
+    query = """
+    MATCH (pg:Paragraph)
+    return pg
+    """
+    records, summary, keys = memgraph_query(query)
+
+    for record in records:
+        paragraph = record["pg"]
+
+        speaker = paragraph._properties["speaker"]
+        while speaker and type(speaker) == dict:
+            if "speaker_id" in speaker and type(speaker["speaker_id"]) == dict:
+                speaker = speaker["speaker_id"]
+            else:
+                break
+
+        query = """
+        MATCH (pg:Paragraph)
+        WHERE id(pg) = $element_id
+        SET pg.speaker = $speaker
+        """
+        records, summary, keys = memgraph_query(
+            query, element_id=paragraph.id, speaker=speaker
+        )
 
 
 class Pipeline:
@@ -944,6 +993,8 @@ class Pipeline:
         # - enrich Person nodes with DBPedia URIs
         # - ENTITIES
         # - add audio clips (later)
+        # - cleanup paragraphs from PodcatEpisode properties
+
         # FIXME: bugs
         # - √ when three or more speakers, issue with parsing
         #   - how to solve?
@@ -1001,19 +1052,19 @@ class Pipeline:
             episode.transcribe()
 
             # clean up transcription / diarization
-            episode.cleanup_transcription()
+            episode.summarize_transcript()
 
             # define speakers
-            episode.define_speakers()
+            episode.define_speakers(rerun=True)
 
             # create Person nodes for speakers
-            episode.create_speakers()
+            episode.create_speakers(rerun=True)
 
             # create Paragraph nodes from transcription
-            episode.paragraphize()
+            episode.paragraphize(rerun=True)
 
             # create embeddings for all text
-            # episode.create_embeddings(overwrite=True)
+            # episode.create_embeddings(rerun=True)
 
             # create statistics
 
@@ -1057,6 +1108,8 @@ def main():
     # init_memgraph()
     # clear_memgraph()
 
+    # debug_clean_up_speakers_in_paragraph_nodes()
+
     podcast = Podcast(url="https://www.youtube.com/@GDiesen1/videos")
     podcast.fetch_meta()
     podcast.save()
@@ -1064,7 +1117,10 @@ def main():
     episodes = podcast.load_episodes()
     logging.info(f"Podcast episodes: {len(episodes)}")
 
-    pipeline = Pipeline(podcast, max_episodes=300, max_workers=1)
+    # for episode in episodes:
+    # episode.debug_clean_up_speakers()
+
+    pipeline = Pipeline(podcast, max_episodes=1, max_workers=1)
     pipeline.run_podcast()
 
     # episode = podcast.get_episode(
