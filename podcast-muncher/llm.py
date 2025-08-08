@@ -149,3 +149,26 @@ class AssignDBPediaUri(dspy.Signature):
     dbpedia_uri: str = dspy.OutputField(
         desc="DBPedia URI, eg. 'https://dbpedia.org/page/Julian_Assange'"
     )
+
+
+class DetermineDuplicateToKeep(dspy.Signature):
+    """
+    Determine which duplicate entity to keep based on the context.
+    The context is a list of entities with their properties, such as name, description, etc.
+    The function should return the entity to keep by ID.
+
+    Criteria in order of importance:
+    1. Highest confidence in dbo_type
+    2. Highest ID (most recent entity), unless no relations to other entities.
+    3. Highest confidence in entity recognition.
+    4. Highest number of relations.
+    5. Most complete description.
+
+    Return:
+    - keeper_id: Entity ID to keep, based on the criteria above.
+    """
+
+    context: list[dict] = dspy.InputField(
+        desc="List of entities with their properties."
+    )
+    keeper_id: int = dspy.OutputField(desc="Entity to keep")
