@@ -27,6 +27,7 @@ from llm import (
 import concurrent.futures
 import secrets
 import string
+from typing import Dict, List, Tuple
 
 
 # memgraph running on host
@@ -1339,6 +1340,128 @@ class Pipeline:
             logging.warning("Episode was not saved to graph.")
 
 
+def merge_duplicate_persons(batch_size=1):
+    """Merge duplicate Person nodes while preserving all relationships (including spaces in types)."""
+
+    # 1. Find all duplicate groups
+    dup_query = """
+    MATCH (p)
+    WHERE p.dbpedia_uri IS NOT NULL
+      AND p.dbpedia_uri <> ''
+    WITH p.dbpedia_uri AS uri, COLLECT(p) AS persons
+    WHERE size(persons) > 1
+    RETURN uri, persons
+    """
+    records, _, _ = memgraph.execute_query(dup_query)
+    print(f"Found {len(records)} duplicate groups.")
+    # print(f"They are: {records}")
+
+    for record in records[:batch_size]:  # Process in batches
+        persons = record["persons"]
+
+        print(f"Processing duplicate group with DBpedia URI: {record['uri']}")
+
+        quit()
+
+        # 2. Select keeper (node with highest ID)
+        keeper = max(persons, key=lambda p: p.id)
+        duplicates = [p for p in persons if p.id != keeper.id]
+
+        print(
+            f"Keeper: {keeper.id}, Duplicates: {[dup.id for dup in duplicates]}"
+        )
+
+        for dup in duplicates:
+            # 3. Transfer OUTGOING relationships (dup -> other)
+            out_query = """
+            MATCH (dup)-[r]->(other)
+            WHERE id(dup) = $dup_id
+            RETURN id(r) AS rel_id, type(r) AS rel_type, properties(r) AS props, id(other) AS other_id
+            """
+            out_records, _, _ = memgraph.execute_query(
+                out_query, {"dup_id": dup.id}
+            )
+            print(f"Found {len(out_records)} outgoing relationships.")
+
+            for rel in out_records:
+                print(f"Processing relationship: {rel}")
+                # Escape backticks in relationship type
+                safe_rel_type = rel["rel_type"].replace("`", "``")
+                create_out = f"""
+                MATCH (keeper), (other)
+                WHERE id(keeper) = $keeper_id AND id(other) = $other_id
+                CREATE (keeper)-[r_new:`{safe_rel_type}`]->(other)
+                SET r_new = $props
+                """
+                print(f"Creating relationship: {create_out}")
+                print(f"With properties: {rel['props']}")
+                print(f"Keeper ID: {keeper.id}, Other ID: {rel['other_id']}")
+                print(f"Relationship type: {safe_rel_type}")
+                print(f"Relationship properties: {rel['props']}")
+
+                memgraph.execute_query(
+                    create_out,
+                    {
+                        "keeper_id": keeper.id,
+                        "other_id": rel["other_id"],
+                        "props": rel["props"],
+                    },
+                )
+
+                # Delete old relationship by ID
+                memgraph.execute_query(
+                    """
+                MATCH ()-[r]->() 
+                WHERE id(r) = $rel_id 
+                DELETE r
+                """,
+                    {"rel_id": rel["rel_id"]},
+                )
+
+            # 4. Transfer INCOMING relationships (other -> dup)
+            in_query = """
+            MATCH (other)-[r]->(dup)
+            WHERE id(dup) = $dup_id
+            RETURN id(r) AS rel_id, type(r) AS rel_type, properties(r) AS props, id(other) AS other_id
+            """
+            in_records, _, _ = memgraph.execute_query(
+                in_query, {"dup_id": dup.id}
+            )
+
+            for rel in in_records:
+                # Escape backticks in relationship type
+                safe_rel_type = rel["rel_type"].replace("`", "``")
+                create_in = f"""
+                MATCH (other), (keeper)
+                WHERE id(other) = $other_id AND id(keeper) = $keeper_id
+                CREATE (other)-[r_new:`{safe_rel_type}`]->(keeper)
+                SET r_new = $props
+                """
+                memgraph.execute_query(
+                    create_in,
+                    {
+                        "keeper_id": keeper.id,
+                        "other_id": rel["other_id"],
+                        "props": rel["props"],
+                    },
+                )
+
+                # Delete old relationship by ID
+                memgraph.execute_query(
+                    """
+                MATCH ()-[r]->() 
+                WHERE id(r) = $rel_id 
+                DELETE r
+                """,
+                    {"rel_id": rel["rel_id"]},
+                )
+
+            # 5. Delete the duplicate node
+            memgraph.execute_query(
+                "MATCH (n) WHERE id(n) = $id DELETE n", {"id": dup.id}
+            )
+
+
 def init_memgraph():
     """
     Initialize Memgraph database with constraints and indexes.
@@ -1388,6 +1511,8 @@ def main():
     # add_dbpedia_uris_to_persons()
     # debug_llm()
     # return
+
+    return merge_duplicate_persons(batch_size=1)
 
     podcast = Podcast(url="https://www.youtube.com/@GDiesen1/videos")
     podcast.fetch_meta()
