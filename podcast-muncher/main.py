@@ -18,7 +18,12 @@ from datetime import datetime, date, timezone
 import logging
 from neo4j import GraphDatabase
 from neo4j.time import DateTime
-from llm import CleanTranscript, DefineSpeakers
+from llm import (
+    CleanTranscript,
+    DefineSpeakers,
+    ExtractEntities,
+    AssignDBPediaUri,
+)
 import concurrent.futures
 import secrets
 import string
@@ -37,12 +42,27 @@ logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
 load_dotenv()
 
-lm = dspy.LM(
-    "openai/gpt-4.1-2025-04-14",
+NER_VERSION = f"{os.getenv("NER_VERSION", "v0.2.1")}-{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')}"
+logging.info(f"Using NER version: {NER_VERSION}")
+
+fast_lm = dspy.LM(
+    # "openai/gpt-4.1-2025-04-14",
+    model=os.getenv("OPENAI_FAST_MODEL", "gpt-5-mini-2025-08-07"),
     api_key=os.getenv("OPENAI_API_KEY"),
-    max_tokens=32768,
+    max_completion_tokens=100000,
+    max_tokens=None,
+    temperature=1,
 )
-dspy.configure(lm=lm)
+strong_lm = dspy.LM(
+    model=os.getenv("OPENAI_STRONG_MODEL", "gpt-5-2025-08-07"),
+    api_key=os.getenv("OPENAI_API_KEY"),
+    max_completion_tokens=100000,
+    max_tokens=None,
+    temperature=1,
+)
+
+# default model
+dspy.configure(lm=fast_lm)
 
 
 def random_string(length: int = 10) -> str:
@@ -86,6 +106,7 @@ def memgraph_query(query: str, **params):
     """
     Execute a query against the Memgraph database.
     """
+    logging.debug(f"Executing query: {query} with params: {params}")
     records, summary, keys = memgraph.execute_query(query, **params)
     return records, summary, keys
 
@@ -213,9 +234,6 @@ class Planning:
         - reference to Person(s)
         - entities (list of entities mentioned in the paragraph)
         - triples (list of triples extracted from the paragraph, ie. edges)
-
-
-
     """
 
 
@@ -248,7 +266,7 @@ class Podcast:
         self.PodcastEpisodes = []
 
         if not self._properties.get("meta"):
-            logging.warning("No meta, can't load episodes.")
+            logging.debug("No meta, can't load episodes.")
             return
 
         entries = self._properties["meta"].get("entries", [])
@@ -365,11 +383,10 @@ class PodcastEpisode:
         self.podcast = podcast
         self._properties = properties
         self._save_queue = []
-        self.Paragraphs = []
 
     def save(self):
         if not self._properties:
-            logging.warning("No properties to save.")
+            logging.debug("No properties to save.")
             return
 
         # Build SET clause dynamically - use 'pe' to match the MERGE variable
@@ -388,7 +405,6 @@ class PodcastEpisode:
         SET he.updated_at = datetime()
         RETURN pe
         """
-        logging.info(f"Saving PodcastEpisode node for URL: {self.url}")
 
         records, summary, keys = memgraph_query(
             query,
@@ -421,7 +437,7 @@ class PodcastEpisode:
 
         transcript = Transcript(podcast_episode_url=self.url).load()
         if transcript and not rerun:
-            logging.info("Already downloaded. Skipping!")
+            logging.debug("Already downloaded. Skipping!")
             return
 
         ydl_opts = {
@@ -436,9 +452,6 @@ class PodcastEpisode:
 
         with YoutubeDL(ydl_opts) as ydl:
             error_code = ydl.download([self.url])
-            logging.info(
-                f"Downloaded {self._properties.get('title')} with error code: {error_code}"
-            )
 
     def transcribe(self, rerun: bool = False):
         """
@@ -448,7 +461,7 @@ class PodcastEpisode:
 
         transcript = Transcript(podcast_episode_url=self.url).load()
         if transcript and not rerun:
-            logging.info("Transcript already exists. Skipping!")
+            logging.debug("Transcript already exists. Skipping!")
             return
 
         logging.info(f"Transcribing {self._properties.get('title')}...")
@@ -484,6 +497,9 @@ class PodcastEpisode:
 
         if prediction.status == "succeeded":
             pred_transcript = prediction.output
+            logging.info(
+                f"Transcription succeeded. Transcript length: {len(pred_transcript.get('segments', []))} segments."
+            )
         if prediction.status == "failed":
             raise ReplicateError(
                 prediction=prediction,
@@ -510,7 +526,7 @@ class PodcastEpisode:
         """
 
         if self._properties.get("paragraphs") and not rerun:
-            logging.info("Paragraphs already exist. Skipping!")
+            logging.debug("Paragraphs already exist. Skipping!")
             return
 
         transcript = Transcript(podcast_episode_url=self.url).load()
@@ -523,7 +539,7 @@ class PodcastEpisode:
         paragraphs = []
         turns = self._combine_turns(transcript._properties)
 
-        logging.info(f"Combined speaker turns into {len(turns)} paragraphs.")
+        logging.debug(f"Combined speaker turns into {len(turns)} paragraphs.")
 
         for turn in turns:
             pred = cleaner(
@@ -552,7 +568,7 @@ class PodcastEpisode:
     def _combine_turns(self, transcript: dict) -> list[dict]:
         """Combine speaker turns into one full turn."""
 
-        logging.info("Combining speaker turns into paragraphs...")
+        logging.debug("Combining speaker turns into paragraphs...")
 
         turns = transcript.get("segments", [])
 
@@ -620,7 +636,7 @@ class PodcastEpisode:
             raise Exception("No paragraphs to define speakers from.")
 
         if self._properties.get("speakers") and not rerun:
-            logging.info("Speakers already defined. Skipping.")
+            logging.debug("Speakers already defined. Skipping.")
             return
 
         logging.info(f"Defining speakers from the transcript... rerun={rerun}")
@@ -640,25 +656,25 @@ class PodcastEpisode:
         #       then check if all speakers are identified in the transcript
         #       if not, then do another run, but with all paragraphs in context
 
-        logging.info(f"Context for speaker definition: {context}")
+        logging.debug(f"Context for speaker definition: {context}")
 
         speaker_definer = dspy.ChainOfThought(DefineSpeakers)
         pred = speaker_definer(context=context)
 
-        logging.info(f"Predicted speakers: {pred}")
+        logging.debug(f"Predicted speakers: {pred}")
 
         if not pred.speakers:
             raise Exception("No speakers defined in the transcript.")
 
-        logging.info(f"Defined speakers: {pred.speakers}")
+        logging.debug(f"Defined speakers: {pred.speakers}")
 
         self._properties["speakers"] = [
             speaker
             for speaker in pred.speakers
-            if speaker.get("full_name") is not None
+            if speaker.get("name") is not None
         ]
 
-        logging.info(
+        logging.debug(
             f"""Defined {len(self._properties['speakers'])} speakers from the transcript: 
             {self._properties['speakers']}"""
         )
@@ -676,26 +692,7 @@ class PodcastEpisode:
             )
             self._save_queue.append(person)
 
-        # Ensure speakers are added to paragraphs
-        # self._ensure_speakers_in_paragraphs()
-
         self.save()
-
-    # def _ensure_speakers_in_paragraphs(self):
-    #     """
-    #     Ensure that speakers are added to paragraphs.
-    #     """
-    #     speakers = self._properties.get("speakers", [])
-    #     for para in self._properties.get("paragraphs", []):
-    #         speaker_id = para.get("speaker")
-    #         if speaker_id:
-    #             # Find the speaker in the defined speakers
-    #             speaker = next(
-    #                 (s for s in speakers if s["speaker_id"] == speaker_id),
-    #                 None,
-    #             )
-    #             if speaker:
-    #                 para["speaker"] = speaker
 
     def paragraphize(self, rerun: bool = False):
         """
@@ -719,18 +716,11 @@ class PodcastEpisode:
                     pg["speaker"] = speaker
 
         paragraphs = [
-            para
-            for para in paragraphs
-            if len(para.get("speech"))
-            # and type(para.get("speaker")) is dict
+            para for para in paragraphs if len(para.get("speech")) > 0
         ]
 
         if not paragraphs:
             raise Exception("No paragraphs to create from.")
-
-        logging.info(
-            f"Creating Paragraph nodes for {len(paragraphs)} paragraphs..."
-        )
 
         previous_paragraph = None
         for para in paragraphs:
@@ -779,74 +769,26 @@ class PodcastEpisode:
             paragraph["speaker"] = speaker
         self.save()
 
-
-class Person:
-    """Person node in the graph, representing a speaker."""
-
-    def __init__(
-        self,
-        properties: dict,
-        podcast_episode: PodcastEpisode = None,
-        role: str = None,
-    ):
-        self._properties = properties
-        self.podcast_episode = podcast_episode
-        self.role = role
-
-    def save(self):
-        """Save Person node to Memgraph and create relationships."""
-
-        if not self._properties.get("full_name"):
-            logging.warning("No full_name provided. Skipping save.")
-            return
-
-        # Build SET clause dynamically
-        filtered_properties = {
-            k: v
-            for k, v in self._properties.items()
-            if k not in ["role", "speaker_id"]
-        }
-        set_clause = ", ".join(
-            [f"p.{key} = ${key}" for key in filtered_properties.keys()]
-            + ["p.updated_at = datetime()"]
+    def extract_entities(self, rerun: bool = False):
+        logging.info(
+            f"Extracting entities for episode {self._properties.get("title")}"
         )
 
-        query = f"""
-        MERGE (p:Person {{full_name: $full_name}})
-        SET {set_clause}
+        # get paragraphs
+        query = """
+        MATCH (p:Paragraph)
+        WHERE p.podcast_episode_url = $podcast_episode_url
         RETURN p
         """
-
         records, summary, keys = memgraph_query(
-            query,
-            **self._properties,
+            query, podcast_episode_url=self.url
         )
 
-        logging.info(
-            f"Saved Person node: {self._properties.get('full_name', 'Unknown')}"
-        )
-
-        # Create relationship based on role
-        if self.podcast_episode and self.role:
-            relationship_type = (
-                "IS_HOST_OF" if self.role == "host" else "IS_GUEST_ON"
-            )
-
-            records, summary, keys = memgraph_query(
-                f"""
-                MATCH (p:Person {{full_name: $full_name}})
-                MATCH (pe:PodcastEpisode {{url: $podcast_episode_url}})
-                MERGE (p)-[rt:{relationship_type}]->(pe)
-                SET rt.updated_at = datetime()
-                RETURN p, pe
-                """,
-                full_name=self._properties["full_name"],
-                podcast_episode_url=self.podcast_episode.url,
-            )
-
-            logging.info(
-                f"Created {relationship_type} relationship for {self._properties['full_name']}"
-            )
+        for record in records:
+            properties = record["p"]._properties
+            paragraph = Paragraph(properties=properties, podcast_episode=self)
+            paragraph.extract_entities(rerun=rerun)
+            paragraph.save()
 
 
 class Paragraph:
@@ -862,14 +804,242 @@ class Paragraph:
         self._podcast_episode = podcast_episode
         self._previous_paragraph = previous_paragraph
 
+    def extract_entities(self, rerun: bool = False):
+        text = self._properties["text"]
+
+        if not text or not len(text):
+            return logging.info("No text to extract entities from. Skipping.")
+
+        if self._properties.get("entities") and not rerun:
+            logging.info("Entities already extracted. Skipping.")
+            return
+
+        # extract entities using dspy
+        with dspy.context(lm=strong_lm):
+            logging.info(
+                f"Extracting entities from paragraph with strong model."
+            )
+            extractor = dspy.ChainOfThought(ExtractEntities)
+            pred = extractor(text=text)
+
+        self._debug_log_pred(pred)
+
+        # create extracted entities and relations in the graph
+        ner_ids = self._create_entities(pred)
+        self._create_relations(pred, ner_ids)
+
+    def _debug_log_pred(self, pred):
+        """Log the prediction details for debugging."""
+
+        if len(pred.entities):
+            for entity in pred.entities:
+                logging.info(
+                    f"Entity --> {entity.get('name')} ({entity['type']} (DBPedia: {entity.get('dbpedia_uri')})) "
+                )
+
+        if len(pred.relations):
+            for edge in pred.relations:
+                source = next(
+                    (
+                        ent
+                        for ent in pred.entities
+                        if ent["ner_id"] == edge["source"]
+                    ),
+                    None,
+                )
+                target = next(
+                    (
+                        ent
+                        for ent in pred.entities
+                        if ent["ner_id"] == edge["target"]
+                    ),
+                    None,
+                )
+                if source and target:
+                    logging.info(
+                        f"""Relation --> {source["name"]} {edge["name"]} {target["name"]} (DBPedia: {edge.get("dbo_type", "")})"""
+                    )
+
+    def _create_entities(self, pred):
+        """Find existing entities in the graph or create new ones based on the prediction."""
+        ner_ids = {}
+
+        for entity in pred.entities:
+
+            if entity.get("confidence", 0) < 0.8:
+                logging.debug(f"Confidence too low, skipping. {entity}")
+                continue
+
+            label = (
+                entity["dbo_type"].split(":")[1]
+                if entity["dbo_type"]
+                else entity["type"].title().replace(" ", "")
+            )
+            dbpedia_uri = entity.get("dbpedia_uri")
+            ner_id = entity.get("ner_id")
+            params = {
+                k: v
+                for k, v in entity.items()
+                if k not in ["ner_id", "confidence", "details"]
+            }
+            params["dbpedia_uri"] = dbpedia_uri
+            params["ner_version"] = NER_VERSION
+
+            existing = self._find_existing_entity(
+                label, dbpedia_uri=dbpedia_uri, name=params.get("name")
+            )
+
+            set_clause = ", ".join(
+                [f"n.{key} = ${key}" for key in params.keys()]
+                + ["n.updated_at = datetime()"]
+            )
+            if not existing:
+                query = f"""
+                CREATE (n:{label})
+                SET {set_clause}
+                RETURN n
+                """
+                records, summary, keys = memgraph_query(query, **params)
+
+            else:
+                query = f"""
+                MATCH (n)
+                WHERE id(n) = $id
+                SET {set_clause}
+                RETURN n
+                """
+                records, summary, keys = memgraph_query(
+                    query, id=int(existing.element_id), **params
+                )
+
+            # store ner_id for later use
+            ner_ids[ner_id] = records[0]["n"].element_id
+
+        self._properties["entities"] = pred.entities
+
+        return ner_ids
+
+    def _create_relations(self, pred, ner_ids):
+        """Create relations between entities based on the prediction."""
+        if not pred.relations:
+            logging.debug("No relations to create.")
+            return
+
+        for edge in pred.relations:
+            if edge.get("confidence", 0) < 0.8:
+                logging.debug(f"Confidence too low, skipping. {edge}")
+                continue
+
+            source_id = ner_ids.get(edge["source"])
+            target_id = ner_ids.get(edge["target"])
+
+            if not source_id or not target_id:
+                logging.debug(f"Source or target not found for edge: {edge}")
+                continue
+
+            # get paragraph node
+            source_paragraph = self._get_node()
+            if not source_paragraph:
+                logging.error(f"Paragraph node not found. Skipping. ")
+                continue
+
+            query = f"""
+            MATCH (s), (t)
+            WHERE id(s) = $source_id AND id(t) = $target_id
+            MERGE (s)-[r:`{edge.get("name")}`]->(t)
+            SET 
+                r.updated_at = datetime(), 
+                r.confidence = $confidence, 
+                r.ner_version = $ner_version,
+                r.description = $description,
+                r.dbo_type = $dbo_type,
+                r.source_paragraph_id = $source_paragraph_id
+            RETURN s, t, r
+            """
+            records, summary, keys = memgraph_query(
+                query,
+                source_id=int(source_id),
+                target_id=int(target_id),
+                confidence=float(edge.get("confidence")),
+                ner_version=NER_VERSION,
+                description=edge.get("description", ""),
+                dbo_type=edge.get("dbo_type", ""),
+                source_paragraph_id=int(source_paragraph.element_id),
+            )
+
+        # store entities and relations in properties
+        self._properties["relations"] = pred.relations
+
+    def _get_node(self):
+        query = """
+        MATCH (p:Paragraph)
+        WHERE p.podcast_episode_url = $podcast_episode_url
+            AND p.start = $start 
+            AND p.end = $end
+        RETURN p
+        """
+        records, summary, keys = memgraph_query(
+            query,
+            podcast_episode_url=self._podcast_episode.url,
+            start=self._properties["start"],
+            end=self._properties["end"],
+        )
+        return records[0]["p"] if records and len(records) > 0 else None
+
+    def _find_existing_entity(self, label, dbpedia_uri=None, name=None):
+        """Try to find an existing entity by dbpedia_uri or name."""
+        if dbpedia_uri:
+            logging.info(
+                f"Trying to find existing entity by DBpedia URI: {dbpedia_uri}"
+            )
+            logging.warning(
+                "OVERRIDE: ENCOURAGE DUPLICATE ENTITIES. RETURNING!"
+            )
+            return None  # TODO: remove this override
+
+            query = f"""
+                MATCH (n:{label})
+                WHERE n.dbpedia_uri = $dbpedia_uri
+                RETURN n
+            """
+            logging.info(f"Query: {query} with dbpedia_uri={dbpedia_uri}")
+
+            records, summary, keys = memgraph_query(
+                query, dbpedia_uri=dbpedia_uri
+            )
+            logging.info(f"Records found: {len(records)}")
+            if records:
+                return records[0]["n"]
+
+        if name:
+            query = f"""
+                MATCH (n:{label})
+                WHERE n.name = $name
+                RETURN n
+            """
+            records, summary, keys = memgraph_query(query, name=f"`{name}`")
+            if records:
+                return records[0]["n"]
+
+        return None
+
     def save(self):
         """Save Paragraph node to Memgraph and create relationships."""
 
         # Build SET clause dynamically
         set_clause = ", ".join(
-            [f"p.{key} = ${key}" for key in self._properties.keys()]
+            [
+                f"p.{key} = ${key}"
+                for key in self._properties.keys()
+                if key != "podcast_episode_url"
+            ]
             + ["p.updated_at = datetime()"]
         )
+        properties = {
+            k: v
+            for k, v in self._properties.items()
+            if k != "podcast_episode_url"
+        }
 
         query = f"""
         MERGE (p:Paragraph {{start: $start, end: $end, podcast_episode_url: $podcast_episode_url}})
@@ -879,12 +1049,8 @@ class Paragraph:
 
         records, summary, keys = memgraph_query(
             query,
-            **self._properties,
             podcast_episode_url=self._podcast_episode.url,
-        )
-
-        logging.debug(
-            f"Saved Paragraph node with start: {self._properties['start']}"
+            **properties,
         )
 
         if not self._previous_paragraph:
@@ -920,20 +1086,89 @@ class Paragraph:
         # Create relationship to Person (SAID)
         speaker_dict = self._properties.get("speaker")
         if speaker_dict:
-            full_name = speaker_dict.get("full_name")
-            if full_name:
+            name = speaker_dict.get("name")
+            if name:
                 memgraph_query(
                     """
                     MATCH (p:Paragraph {start: $start, end: $end, podcast_episode_url: $podcast_episode_url})
-                    MATCH (person:Person {full_name: $full_name})
+                    MATCH (person:Person {name: $name})
                     MERGE (person)-[eb:SAID]->(p)
                     SET eb.updated_at = datetime()
                     """,
                     start=self._properties["start"],
                     end=self._properties["end"],
                     podcast_episode_url=self._podcast_episode.url,
-                    full_name=full_name,
+                    name=name,
                 )
+
+
+class Person:
+    """Person node in the graph, representing a speaker."""
+
+    def __init__(
+        self,
+        properties: dict,
+        podcast_episode: PodcastEpisode = None,
+        role: str = None,
+    ):
+        self._properties = properties
+        self.podcast_episode = podcast_episode
+        self.role = role
+
+    def save(self):
+        """Save Person node to Memgraph and create relationships."""
+
+        if not self._properties.get("name"):
+            logging.warning("No name provided. Skipping save.")
+            return
+
+        # Build SET clause dynamically
+        filtered_properties = {
+            k: v
+            for k, v in self._properties.items()
+            if k not in ["role", "speaker_id"]
+        }
+        set_clause = ", ".join(
+            [f"p.{key} = ${key}" for key in filtered_properties.keys()]
+            + ["p.updated_at = datetime()"]
+        )
+
+        query = f"""
+        MERGE (p:Person {{name: $name}})
+        SET {set_clause}
+        RETURN p
+        """
+
+        records, summary, keys = memgraph_query(
+            query,
+            **self._properties,
+        )
+
+        logging.debug(
+            f"Saved Person node: {self._properties.get('name', 'Unknown')}"
+        )
+
+        # Create relationship based on role
+        if self.podcast_episode and self.role:
+            relationship_type = (
+                "IS_HOST_OF" if self.role == "host" else "IS_GUEST_ON"
+            )
+
+            records, summary, keys = memgraph_query(
+                f"""
+                MATCH (p:Person {{name: $name}})
+                MATCH (pe:PodcastEpisode {{url: $podcast_episode_url}})
+                MERGE (p)-[rt:{relationship_type}]->(pe)
+                SET rt.updated_at = datetime()
+                RETURN p, pe
+                """,
+                name=self._properties["name"],
+                podcast_episode_url=self.podcast_episode.url,
+            )
+
+            logging.debug(
+                f"Created {relationship_type} relationship for {self._properties['name']}"
+            )
 
 
 class Sentence:
@@ -972,6 +1207,44 @@ def debug_clean_up_speakers_in_paragraph_nodes():
         )
 
 
+def add_dbpedia_uris_to_persons():
+
+    query = """
+    MATCH (p:Person)
+    RETURN p
+    """
+    records, summary, keys = memgraph_query(query)
+
+    assigner = dspy.ChainOfThought(AssignDBPediaUri)
+
+    for record in records:
+        person = record["p"]._properties
+        context = f"""
+        Name: {person.get("name", None)}
+        Title: {person.get("title", None)}
+        Description: {person.get("description_long", person.get("description", None))}
+        """
+        pred = assigner(context=context)
+
+        logging.debug(f"Got pred: {pred}")
+        dbpedia_uri = pred.dbpedia_uri
+
+        if dbpedia_uri == "None":
+            logging.debug("No DBPedia")
+            continue
+
+        query = """
+        MATCH (p:Person)
+        WHERE id(p) = $element_id
+        SET p.dbpedia_uri = $dbpedia_uri
+        """
+        records, summary, keys = memgraph_query(
+            query, element_id=record["p"].id, dbpedia_uri=dbpedia_uri
+        )
+
+        logging.debug(f"Updated dbpedia_uri: {dbpedia_uri}")
+
+
 class Pipeline:
     def __init__(
         self, podcast: Podcast, max_episodes: int = 3, max_workers: int = 5
@@ -987,24 +1260,14 @@ class Pipeline:
         # - √ Add Transcript node
         # - create embeddings of all text
         #   > on paragraphs (text, one_sentence, few_sentences)
-        #   > on person (full_name + description)
+        #   > on person (name + description)
         #   > on podcast_episode (title + description)
+        # - √ Add entities, edges
         # - add stats (word count, sentence count)
         # - enrich Person nodes with DBPedia URIs
-        # - ENTITIES
         # - add audio clips (later)
         # - cleanup paragraphs from PodcatEpisode properties
-
-        # FIXME: bugs
-        # - √ when three or more speakers, issue with parsing
-        #   - how to solve?
-        #     a) use short video clip?
-        #     b) match audio with known audio of speakers?
-        #     c) look through whole transcript for hint to speaker name per turn?
-        #     ... tricky. need backup, ie. add paragraphs even without speakers
-        # - √ when only one speaker, issue with parsing (also will have too long paragraph)
-        # - √ Person node without name should not be created
-        # - √ clean up messy edges
+        # - use pydantic models
 
         episodes = self.podcast.PodcastEpisodes
         if not episodes:
@@ -1036,10 +1299,10 @@ class Pipeline:
         concurrent.futures.wait(futures)
 
     def run_episode_tasks(self, episode: PodcastEpisode):
-        logging.info("")
-        logging.info(f">>>>>>>>>>>>>>")
-        logging.info(f">> Pipeline: Running episode: {episode.url}")
-        logging.info(f">>>>>>>>>>>>>>")
+        # logging.info("")
+        # logging.info(f">>>>>>>>>>>>>>")
+        # logging.info(f">> Pipeline: Running episode: {episode.url}")
+        # logging.info(f">>>>>>>>>>>>>>")
 
         try:
 
@@ -1055,16 +1318,19 @@ class Pipeline:
             episode.summarize_transcript()
 
             # define speakers
-            episode.define_speakers(rerun=True)
+            episode.define_speakers()
 
             # create Person nodes for speakers
-            episode.create_speakers(rerun=True)
+            episode.create_speakers()
 
             # create Paragraph nodes from transcription
-            episode.paragraphize(rerun=True)
+            episode.paragraphize()
 
             # create embeddings for all text
             # episode.create_embeddings(rerun=True)
+
+            # extract entities
+            episode.extract_entities(rerun=True)
 
             # create statistics
 
@@ -1083,8 +1349,9 @@ def init_memgraph():
         session.run(
             "CREATE CONSTRAINT ON (pe:PodcastEpisode) ASSERT pe.url IS UNIQUE"
         )
+        # TODO: contraint on dbpedia_uri for nodes
         session.run("CREATE INDEX ON :Person")
-        session.run("CREATE INDEX ON :Person(full_name)")
+        session.run("CREATE INDEX ON :Person(name)")
         session.run("CREATE INDEX ON :Transcript")
         session.run("CREATE INDEX ON :Transcript(podcast_episode_url)")
         session.run("CREATE INDEX ON :Paragraph")
@@ -1104,11 +1371,23 @@ def clear_memgraph():
         logging.info("Cleared all nodes and edges in Memgraph.")
 
 
+# def debug_llm():
+#     """Debug LLM functionality."""
+#     from dspy import ChainOfThought
+
+#     # Example usage of dspy
+#     reply = lm("")
+#     print("LLM Reply:", reply)
+
+
 def main():
     # init_memgraph()
     # clear_memgraph()
 
     # debug_clean_up_speakers_in_paragraph_nodes()
+    # add_dbpedia_uris_to_persons()
+    # debug_llm()
+    # return
 
     podcast = Podcast(url="https://www.youtube.com/@GDiesen1/videos")
     podcast.fetch_meta()
@@ -1120,7 +1399,7 @@ def main():
     # for episode in episodes:
     # episode.debug_clean_up_speakers()
 
-    pipeline = Pipeline(podcast, max_episodes=1, max_workers=1)
+    pipeline = Pipeline(podcast, max_episodes=300, max_workers=1)
     pipeline.run_podcast()
 
     # episode = podcast.get_episode(
