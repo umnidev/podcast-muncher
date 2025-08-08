@@ -1,4 +1,5 @@
 from functools import wraps
+import voyageai
 from yt_dlp import YoutubeDL
 import replicate
 from replicate.exceptions import ReplicateError
@@ -792,6 +793,147 @@ class PodcastEpisode:
             paragraph.extract_entities(rerun=rerun)
             paragraph.save()
 
+    def create_stats(self):
+        # word count per episode
+        # word count per paragraph
+
+        pass
+
+    def create_embeddings(self, rerun: bool = False):
+        """Create vector embeddings for nodes and edges."""
+        # paragraph text
+        # paragraph few_sentence (?)
+        # edge description
+        #
+        # just have to test it out:
+        # - edge.descriptions (small) linked to source_paragraph_id
+        #   - add all 20 edges as separate chunks, and append whole paragraph as last chunk for more context
+        # - paragraph as chunk in list of all paragraphs in PodcastEpisode
+        # - few_sentences as chunk in list of all few_sentences in (pe)
+        # the POINT when running a query, is to find:
+        # - FACTS (edges)
+        # - the relevant paragraphs (p:Paragraph nodes)
+        #
+
+        # get paragraphs from graph
+        query = """
+        MATCH (p:Paragraph)
+        WHERE p.podcast_episode_url = $podcast_episode_url
+        RETURN p
+        """
+        records, summary, keys = memgraph_query(
+            query, podcast_episode_url=self.url
+        )
+        if not records or len(records) == 0:
+            logging.warning(
+                f"No paragraphs found for podcast episode {self.url}. Skipping embedding generation."
+            )
+            return
+        # create list of paragraphs to embed
+        paragraphs = []
+        for record in records:
+            properties = record["p"]._properties
+            text = properties.get("text", "")
+            if not text or len(text) < 200:
+                continue
+
+            speaker = properties.get("speaker", {}).get(
+                "name", "Unknown Speaker"
+            )
+
+            p = {
+                "id": record["p"].element_id,
+                "speaker": speaker,
+                "text": text,
+                "few_sentences": properties.get("few_sentences", ""),
+                "one_sentence": properties.get("one_sentence", ""),
+                "paragraph_id": properties.get("paragraph_id", ""),
+            }
+
+            paragraphs.append(p)
+
+        text_inputs = []
+        for p in paragraphs:
+            # create text input for embedding
+            text_input = f"{p['speaker']} said: \n {p['text']}"
+            text_inputs.append(text_input)
+
+        embeddings = self._generate_document_embedding([text_inputs])
+
+        # Debug: Check available attributes
+        print(f"Available attributes: {dir(embeddings)}")
+        print(f"Type: {type(embeddings)}")
+
+        # Try different possible attribute names
+        for attr in ["data", "embedding", "embeddings", "results", "output"]:
+            if hasattr(embeddings, attr):
+                print(f"Found attribute '{attr}': {getattr(embeddings, attr)}")
+
+        # Access the results and extract embeddings
+        embedding_results = embeddings.results
+        print(f"Number of embedding results: {len(embedding_results)}")
+
+        # Extract embeddings and indices for later use
+        embeddings_list = []
+        indices_list = []
+
+        result = embedding_results[0] if embedding_results else None
+        if not result:
+            logging.error("No embedding results found. Exiting.")
+            return
+
+        # for result in embedding_results:
+        #     indices_list.append(result.index)
+        #     embeddings_list.append(result.embeddings)
+        #     print(
+        #         f"Index: {result.index}, Embedding shape: {len(result.embeddings) if result.embeddings else 0}"
+        #     )
+
+        print(f"Total tokens used: {embeddings.total_tokens}")
+        print(f"Total paragraphs: {len(paragraphs)}")
+
+        for i, p in enumerate(paragraphs):
+            p["em_text"] = result.embeddings[i]
+
+        # save embeddings to graph
+        for p in paragraphs:
+            print(f"Saving embedding for paragraph {p}...")
+            if "em_text" in p:
+                query = """
+                MATCH (p:Paragraph)
+                WHERE id(p) = $id
+                SET p.em_text = $em_text
+                RETURN p
+                """
+                records, summary, keys = memgraph_query(
+                    query, id=int(p["id"]), em_text=p["em_text"]
+                )
+                if records and len(records):
+                    logging.info(f"Saved embedding for paragraph {p['id']}.")
+                else:
+                    logging.warning(
+                        f"Failed to save embedding for paragraph {p['id']}."
+                    )
+
+    def _generate_document_embedding(self, inputs: List[List[str]]):
+        """Generate document embeddings using VoyageAI."""
+        logging.info(
+            f"Generating document embeddings for {len(inputs)} inputs."
+        )
+        vo = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
+        embeddings = vo.contextualized_embed(
+            inputs=inputs,
+            model="voyage-context-3",
+            output_dimension=512,
+            input_type="document",
+        )
+        # ContextualizedEmbeddingsObject
+        logging.info(
+            f"Generated embeddings with {embeddings.total_tokens} tokens."
+        )
+        # logging.info(f"Embedding results: {embeddings.results}")
+        return embeddings
+
 
 class Paragraph:
     """Each paragraph of text, from a single speaker."""
@@ -994,10 +1136,10 @@ class Paragraph:
             logging.info(
                 f"Trying to find existing entity by DBpedia URI: {dbpedia_uri}"
             )
-            logging.warning(
-                "OVERRIDE: ENCOURAGE DUPLICATE ENTITIES. RETURNING!"
-            )
-            return None  # TODO: remove this override
+            # logging.warning(
+            #     "OVERRIDE: ENCOURAGE DUPLICATE ENTITIES. RETURNING!"
+            # )
+            # return None  # TODO: remove this override
 
             query = f"""
                 MATCH (n:{label})
@@ -1249,11 +1391,16 @@ def add_dbpedia_uris_to_persons():
 
 class Pipeline:
     def __init__(
-        self, podcast: Podcast, max_episodes: int = 3, max_workers: int = 5
+        self,
+        podcast: Podcast,
+        max_episodes: int = 3,
+        max_workers: int = 5,
+        skip_num_episodes: int = 0,
     ):
         self.podcast = podcast
         self.max_episodes = max_episodes
         self.max_workers = max_workers
+        self.skip_num_episodes = skip_num_episodes
 
     def run_podcast(self):
 
@@ -1264,9 +1411,10 @@ class Pipeline:
         #   > on paragraphs (text, one_sentence, few_sentences)
         #   > on person (name + description)
         #   > on podcast_episode (title + description)
+        #   > on rels
         # - √ Add entities, edges
         # - add stats (word count, sentence count)
-        # - enrich Person nodes with DBPedia URIs
+        # - √ enrich Person nodes with DBPedia URIs
         # - add audio clips (later)
         # - cleanup paragraphs from PodcatEpisode properties
         # - use pydantic models
@@ -1274,17 +1422,6 @@ class Pipeline:
         episodes = self.podcast.PodcastEpisodes
         if not episodes:
             episodes = self.podcast.load_episodes()
-
-        # Filter out episodes that are already processed
-        # logging.info(
-        #     f"Filtering episodes that are already processed... Total: {len(episodes)}"
-        # )
-        # episodes = [
-        #     episode
-        #     for episode in episodes
-        #     if not episode._properties.get("updated_at")
-        # ]
-        # logging.info(f"Filtered episodes: {len(episodes)}")
 
         logging.info(
             f"Pipeline episodes: {len(episodes)}. Handling {self.max_episodes} episodes."
@@ -1295,16 +1432,14 @@ class Pipeline:
         ) as executor:
             futures = [
                 executor.submit(self.run_episode_tasks, episode)
-                for episode in episodes[: self.max_episodes]
+                for episode in episodes[
+                    self.skip_num_episodes : self.max_episodes
+                ]
             ]
 
         concurrent.futures.wait(futures)
 
     def run_episode_tasks(self, episode: PodcastEpisode):
-        # logging.info("")
-        # logging.info(f">>>>>>>>>>>>>>")
-        # logging.info(f">> Pipeline: Running episode: {episode.url}")
-        # logging.info(f">>>>>>>>>>>>>>")
 
         try:
 
@@ -1328,11 +1463,14 @@ class Pipeline:
             # create Paragraph nodes from transcription
             episode.paragraphize()
 
-            # create embeddings for all text
-            # episode.create_embeddings(rerun=True)
-
             # extract entities
-            episode.extract_entities(rerun=True)
+            episode.extract_entities()
+
+            # create stats
+            # episode.create_stats()
+
+            # create embeddings for all text
+            episode.create_embeddings(rerun=True)
 
             # create statistics
 
@@ -1342,9 +1480,13 @@ class Pipeline:
 
 
 def merge_duplicate_persons(batch_size=1, max_workers=1):
-    """Merge duplicate Person nodes with the following keeper selection:
+    """Merge duplicate nodes with the following keeper selection:
     1. Highest ID node WITH relationships is keeper
     2. If none have relationships, fall back to highest ID
+
+    Will merge all relationships from duplicates to the keeper.
+    Will delete all duplicate nodes.
+    Will keep the properties of the keeper.
     """
 
     # 1. Find all duplicate groups
@@ -1536,11 +1678,13 @@ def init_memgraph():
     """
     with memgraph.session() as session:
         # Create constraint for Podcast
+        # TODO: contraint on dbpedia_uri for nodes
         session.run("CREATE CONSTRAINT ON (p:Podcast) ASSERT p.url IS UNIQUE")
         session.run(
             "CREATE CONSTRAINT ON (pe:PodcastEpisode) ASSERT pe.url IS UNIQUE"
         )
-        # TODO: contraint on dbpedia_uri for nodes
+
+        # index
         session.run("CREATE INDEX ON :Person")
         session.run("CREATE INDEX ON :Person(name)")
         session.run("CREATE INDEX ON :Transcript")
@@ -1551,6 +1695,17 @@ def init_memgraph():
         session.run("CREATE INDEX ON :Paragraph(end)")
         session.run("CREATE INDEX ON :PodcastEpisode")
         session.run("CREATE INDEX ON :PodcastEpisode(url)")
+
+        # vector index
+        session.run(
+            f"""CREATE VECTOR INDEX vidx_paragraph_text ON :Paragraph(em_text) WITH CONFIG {{"dimension": 512, "capacity": 1024}};"""
+        )
+        session.run(
+            f"""CREATE VECTOR INDEX vidx_paragraph_fews ON :Paragraph(em_few_sentences) WITH CONFIG {{"dimension": 512, "capacity": 1024}};"""
+        )
+        session.run(
+            f"""CREATE VECTOR INDEX vidx_paragraph_ones ON :Paragraph(em_one_sentence) WITH CONFIG {{"dimension": 512, "capacity": 1024}};"""
+        )
 
 
 def clear_memgraph():
@@ -1573,14 +1728,14 @@ def clear_memgraph():
 
 def main():
     # init_memgraph()
-    # clear_memgraph()
+    # no! clear_memgraph()
 
     # debug_clean_up_speakers_in_paragraph_nodes()
     # add_dbpedia_uris_to_persons()
     # debug_llm()
     # return
 
-    return merge_duplicate_persons(batch_size=10, max_workers=1)
+    # return merge_duplicate_persons(batch_size=10, max_workers=1)
 
     podcast = Podcast(url="https://www.youtube.com/@GDiesen1/videos")
     podcast.fetch_meta()
@@ -1592,7 +1747,9 @@ def main():
     # for episode in episodes:
     # episode.debug_clean_up_speakers()
 
-    pipeline = Pipeline(podcast, max_episodes=300, max_workers=1)
+    pipeline = Pipeline(
+        podcast, max_episodes=4, max_workers=1, skip_num_episodes=3
+    )
     pipeline.run_podcast()
 
     # episode = podcast.get_episode(

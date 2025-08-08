@@ -12,9 +12,12 @@ services:
       - "--log-level=INFO"
       - "--also-log-to-stderr"
       - "--query-execution-timeout-sec=600"
-      - "--storage-snapshot-interval-sec=300"
+      - "--storage-snapshot-interval-sec=3600"
       - "--cartesian-product-enabled=false"
       - "--telemetry-enabled=false"
+      - "--storage-automatic-label-index-creation-enabled=true"
+      - "--storage-automatic-edge-type-index-creation-enabled=true"
+      - "--storage-property-store-compression-enabled=true"
 
   lab:
     image: memgraph/lab:latest
