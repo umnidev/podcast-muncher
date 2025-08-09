@@ -829,6 +829,7 @@ class PodcastEpisode:
                 f"No paragraphs found for podcast episode {self.url}. Skipping embedding generation."
             )
             return
+
         # create list of paragraphs to embed
         paragraphs = []
         for record in records:
@@ -860,37 +861,12 @@ class PodcastEpisode:
 
         embeddings = self._generate_document_embedding([text_inputs])
 
-        # Debug: Check available attributes
-        print(f"Available attributes: {dir(embeddings)}")
-        print(f"Type: {type(embeddings)}")
-
-        # Try different possible attribute names
-        for attr in ["data", "embedding", "embeddings", "results", "output"]:
-            if hasattr(embeddings, attr):
-                print(f"Found attribute '{attr}': {getattr(embeddings, attr)}")
-
         # Access the results and extract embeddings
         embedding_results = embeddings.results
-        print(f"Number of embedding results: {len(embedding_results)}")
-
-        # Extract embeddings and indices for later use
-        embeddings_list = []
-        indices_list = []
-
         result = embedding_results[0] if embedding_results else None
         if not result:
             logging.error("No embedding results found. Exiting.")
             return
-
-        # for result in embedding_results:
-        #     indices_list.append(result.index)
-        #     embeddings_list.append(result.embeddings)
-        #     print(
-        #         f"Index: {result.index}, Embedding shape: {len(result.embeddings) if result.embeddings else 0}"
-        #     )
-
-        print(f"Total tokens used: {embeddings.total_tokens}")
-        print(f"Total paragraphs: {len(paragraphs)}")
 
         for i, p in enumerate(paragraphs):
             p["em_text"] = result.embeddings[i]
@@ -1089,9 +1065,11 @@ class Paragraph:
 
             query = f"""
             MATCH (s), (t)
-            WHERE id(s) = $source_id AND id(t) = $target_id
-            MERGE (s)-[r:`{edge.get("name")}`]->(t)
+            WHERE id(s) = $source_id 
+              AND id(t) = $target_id
+            MERGE (s)-[r:CLAIM]->(t)
             SET 
+                r.title = $title,
                 r.updated_at = datetime(), 
                 r.confidence = $confidence, 
                 r.ner_version = $ner_version,
@@ -1102,6 +1080,7 @@ class Paragraph:
             """
             records, summary, keys = memgraph_query(
                 query,
+                title=edge.get("name", ""),
                 source_id=int(source_id),
                 target_id=int(target_id),
                 confidence=float(edge.get("confidence")),
